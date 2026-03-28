@@ -51,3 +51,26 @@ Data Handling: Pandas, NumPy
 Imbalance Handling: Imbalanced-learn (SMOTE)
 Web Scraping: BeautifulSoup
 APIs: Google Fact Check Tools API
+
+
+🧠 ML Pipeline Architecture
+
+Data Sources (PolitiFact + Google API)
+            ↓
+      Data Cleaning
+            ↓
+   NLP Feature Engineering
+            ↓
+   Feature Vectorization
+            ↓
+ Model Training (SVM, LR, NB, DT)
+            ↓
+ Cross Validation + SMOTE
+            ↓
+ Model Evaluation Dashboard
+            ↓
+ Real-time Fact Checking
+
+
+
+
