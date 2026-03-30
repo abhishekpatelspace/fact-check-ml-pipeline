@@ -1,3 +1,5 @@
+LIVE at - https://fact-check-ml-pipeline.onrender.com/
+
 🧠 ML-Powered Fact-Checking System
 
 A Machine Learning + NLP-based web application that automatically classifies political statements and online claims as True or False, combining real-time data, linguistic analysis, and robust model evaluation.
