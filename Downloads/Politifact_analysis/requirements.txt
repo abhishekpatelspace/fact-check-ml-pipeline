@@ -1,0 +1,17 @@
+# FactChecker AI Platform — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+streamlit>=1.32.0
+pandas>=2.0.0
+numpy>=1.26.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+matplotlib>=3.8.0
+scipy>=1.12.0
+textblob>=0.18.0
+scikit-learn>=1.4.0
+imbalanced-learn>=0.12.0
+
+# SpaCy + English model (direct wheel — required for Streamlit Cloud)
+spacy>=3.7.0
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl

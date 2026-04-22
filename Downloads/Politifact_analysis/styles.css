@@ -1,0 +1,261 @@
+/* ============================================================
+   FactChecker Platform - Adaptive Day/Night Theme
+   Automatically follows OS/browser theme using prefers-color-scheme.
+   ============================================================ */
+
+:root {
+    color-scheme: light dark;
+
+    --bg-primary: #f5f7fb;
+    --bg-secondary: #ffffff;
+    --bg-sidebar: #eaf0f9;
+
+    --text-primary: #1d2a3a;
+    --text-secondary: #425466;
+    --text-muted: #6b7b8d;
+
+    --accent: #007ea8;
+    --accent-alt: #00a4c9;
+    --accent-soft: rgba(0, 126, 168, 0.15);
+
+    --border: #ced8e5;
+    --shadow: 0 10px 28px rgba(13, 32, 57, 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg-primary: #0d141d;
+        --bg-secondary: #121d29;
+        --bg-sidebar: #101a25;
+
+        --text-primary: #eef4ff;
+        --text-secondary: #d3deeb;
+        --text-muted: #95a8bc;
+
+        --accent: #37c2e8;
+        --accent-alt: #7fe5ff;
+        --accent-soft: rgba(55, 194, 232, 0.18);
+
+        --border: #23364a;
+        --shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+    }
+}
+
+.main .block-container {
+    background:
+        radial-gradient(circle at 10% -10%, var(--accent-soft), transparent 35%),
+        radial-gradient(circle at 90% 120%, var(--accent-soft), transparent 35%),
+        var(--bg-primary) !important;
+    color: var(--text-secondary) !important;
+}
+
+.main * {
+    color: var(--text-secondary) !important;
+}
+
+h1, h2, h3, h4, h5, h6 {
+    color: var(--text-primary) !important;
+    font-weight: 650;
+    letter-spacing: 0.01em;
+}
+
+p, div, span, li, td, th, label,
+.stMarkdown, .stCaption, .stText {
+    color: var(--text-secondary) !important;
+}
+
+[data-testid="stSidebar"] {
+    background: var(--bg-sidebar) !important;
+    border-right: 1px solid var(--border);
+}
+
+[data-testid="stSidebar"] * {
+    color: var(--text-primary) !important;
+}
+
+.sidebar-brand {
+    text-align: center;
+    padding: 1rem 0;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 1rem;
+}
+
+.sidebar-brand h2 {
+    color: var(--accent) !important;
+    margin: 0 0 0.4rem 0;
+    font-weight: 750;
+}
+
+.sidebar-brand p {
+    color: var(--text-muted) !important;
+    margin: 0;
+    font-size: 0.9rem;
+}
+
+.main-header {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-alt) 100%);
+    padding: 2rem;
+    border-radius: 12px;
+    margin-bottom: 2rem;
+    border: 1px solid transparent;
+    box-shadow: var(--shadow);
+}
+
+.main-header h1,
+.main-header h3 {
+    color: #ffffff !important;
+    text-align: center;
+    margin: 0;
+}
+
+.main-header h1 {
+    font-size: clamp(1.6rem, 4vw, 2.5rem);
+    margin-bottom: 0.5rem;
+}
+
+.main-header h3 {
+    font-size: clamp(0.95rem, 2.2vw, 1.1rem);
+    opacity: 0.95;
+    font-weight: 450;
+}
+
+.card,
+.metric-card,
+[data-testid="metric-container"] {
+    background: var(--bg-secondary) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: 12px;
+    box-shadow: var(--shadow);
+    color: var(--text-secondary) !important;
+}
+
+.card {
+    padding: 1.2rem;
+    margin-bottom: 1rem;
+    transition: transform 0.2s ease, border-color 0.2s ease;
+}
+
+.card:hover {
+    transform: translateY(-2px);
+    border-color: var(--accent) !important;
+}
+
+.card h3, .card h4, .card p,
+.card li, .card span, .card div {
+    color: var(--text-secondary) !important;
+}
+
+.metric-card {
+    text-align: center;
+    padding: 1rem;
+}
+
+.metric-card h2 {
+    color: var(--accent) !important;
+    font-size: 1.8rem;
+    font-weight: 750;
+}
+
+.stButton > button {
+    background: linear-gradient(135deg, var(--accent) 0%, var(--accent-alt) 100%);
+    color: #ffffff !important;
+    border: none;
+    padding: 0.7rem 1.5rem;
+    border-radius: 10px;
+    font-weight: 650;
+    width: 100%;
+    box-shadow: 0 8px 18px rgba(0, 126, 168, 0.25);
+    transition: transform 0.15s ease, filter 0.15s ease;
+}
+
+.stButton > button:hover {
+    transform: translateY(-1px);
+    filter: brightness(1.05);
+}
+
+.feature-pill {
+    background: var(--accent-soft);
+    color: var(--text-primary) !important;
+    border: 1px solid var(--border);
+    padding: 0.3rem 0.8rem;
+    border-radius: 20px;
+    font-size: 0.8rem;
+    margin: 0.2rem;
+    display: inline-block;
+}
+
+.success-box,
+.warning-box,
+.info-box {
+    color: var(--text-secondary) !important;
+    padding: 0.9rem 1rem;
+    border-radius: 10px;
+    margin: 1rem 0;
+    border: 1px solid var(--border);
+    background: var(--bg-secondary);
+}
+
+.success-box { border-left: 4px solid #27ae60; }
+.warning-box { border-left: 4px solid #f39c12; }
+.info-box    { border-left: 4px solid var(--accent); }
+
+.dataframe {
+    background: var(--bg-secondary) !important;
+    color: var(--text-secondary) !important;
+    border: 1px solid var(--border);
+}
+
+.dataframe th {
+    background-color: var(--accent) !important;
+    color: #ffffff !important;
+    border: 1px solid var(--border);
+}
+
+.dataframe td {
+    background-color: var(--bg-secondary) !important;
+    color: var(--text-secondary) !important;
+    border: 1px solid var(--border);
+}
+
+.stTextInput input,
+.stNumberInput input,
+.stTextArea textarea,
+.streamlit-expanderHeader {
+    background-color: var(--bg-secondary) !important;
+    color: var(--text-secondary) !important;
+    border: 1px solid var(--border) !important;
+}
+
+.stProgress > div > div {
+    background-color: var(--accent) !important;
+}
+
+[data-testid="metric-container"] label {
+    color: var(--text-muted) !important;
+}
+
+[data-testid="metric-container"] div {
+    color: var(--accent) !important;
+    font-weight: 750;
+}
+
+.stChart {
+    background: var(--bg-secondary) !important;
+    border-radius: 10px;
+}
+
+hr {
+    border-color: var(--border) !important;
+}
+
+@media (max-width: 768px) {
+    .main-header {
+        padding: 1.3rem;
+        border-radius: 10px;
+    }
+
+    .card,
+    .metric-card {
+        padding: 1rem;
+    }
+}
