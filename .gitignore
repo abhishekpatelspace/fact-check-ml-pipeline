@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+.streamlit/secrets.toml
+*.pyc
+google_benchmark_results.csv
+google_claims_processed.csv
