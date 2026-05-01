@@ -9,6 +9,8 @@ from urllib.parse import urljoin
 import time
 import random
 import matplotlib.pyplot as plt
+import plotly.express as px
+import plotly.graph_objects as go
 
 # --- NEW DEP: Imbalanced-learn ---
 from imblearn.over_sampling import SMOTE
@@ -29,6 +31,14 @@ from sklearn.preprocessing import LabelEncoder
 from scipy import sparse
 import io
 import os
+
+# --- Deep Learning Imports ---
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, LSTM, Embedding, Bidirectional
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.preprocessing.text import Tokenizer as KerasTokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
 
 # --- Configuration ---
 SCRAPED_DATA_PATH = 'politifact_data.csv'
@@ -150,78 +160,91 @@ def get_demo_google_claims():
 def fetch_google_claims(api_key, num_claims=100):
     """
     Fetches claims from Google Fact Check API with pagination handling.
+    Uses multiple broad query terms to fetch diverse fact-checked claims.
     """
     base_url = "https://factchecktools.googleapis.com/v1alpha1/claims:search"
     collected_claims = []
-    page_token = None
     placeholder = st.empty()
+    
+    # The API requires a 'query' parameter; use broad topics to get diverse claims
+    search_queries = [
+        "politics", "health", "economy", "climate", "election",
+        "vaccine", "immigration", "education", "crime", "tax",
+        "government", "president", "congress", "covid", "energy"
+    ]
 
     try:
-        while len(collected_claims) < num_claims:
-            # Build request parameters
-            params = {
-                'key': api_key,
-                'languageCode': 'en',
-                'pageSize': min(100, num_claims - len(collected_claims))
-            }
+        for query_term in search_queries:
+            if len(collected_claims) >= num_claims:
+                break
+            
+            page_token = None
+            
+            while len(collected_claims) < num_claims:
+                # Build request parameters
+                params = {
+                    'key': api_key,
+                    'query': query_term,
+                    'languageCode': 'en',
+                    'pageSize': min(100, num_claims - len(collected_claims))
+                }
 
-            if page_token:
-                params['pageToken'] = page_token
+                if page_token:
+                    params['pageToken'] = page_token
 
             # Update progress
-            placeholder.text(f"Fetching Google claims... {len(collected_claims)} collected so far")
+                # Update progress
+                placeholder.text(f"Fetching Google claims... {len(collected_claims)} collected so far (query: '{query_term}')")
 
-            # Make API request
-            response = requests.get(base_url, params=params, timeout=15)
+                # Make API request
+                response = requests.get(base_url, params=params, timeout=15)
 
-            # Check for HTTP errors
-            if response.status_code == 401:
-                st.error("Invalid API key. Please check your GOOGLE_API_KEY in .streamlit/secrets.toml")
-                return []
-            elif response.status_code == 403:
-                st.error("API access forbidden. Ensure 'Fact Check Tools API' is enabled in Google Cloud Console.")
-                return []
-            elif response.status_code == 429:
-                st.error("API rate limit exceeded. Please try again later with fewer claims.")
-                return []
+                # Check for HTTP errors
+                if response.status_code == 401:
+                    st.error("Invalid API key. Please check your GOOGLE_API_KEY in .streamlit/secrets.toml")
+                    return []
+                elif response.status_code == 403:
+                    st.error("API access forbidden. Ensure 'Fact Check Tools API' is enabled in Google Cloud Console.")
+                    return []
+                elif response.status_code == 429:
+                    st.error("API rate limit exceeded. Please try again later with fewer claims.")
+                    return []
 
-            response.raise_for_status()
-            data = response.json()
+                response.raise_for_status()
+                data = response.json()
 
-            # Check if response has claims
-            if 'claims' not in data or not data['claims']:
-                placeholder.success(f"Fetched {len(collected_claims)} claims (no more available)")
-                break
+                # Check if response has claims
+                if 'claims' not in data or not data['claims']:
+                    break  # No more results for this query, try next one
 
-            # Process each claim
-            for claim_obj in data['claims']:
-                if len(collected_claims) >= num_claims:
-                    break
+                # Process each claim
+                for claim_obj in data['claims']:
+                    if len(collected_claims) >= num_claims:
+                        break
 
-                # Extract claim text
-                claim_text = claim_obj.get('text', '')
+                    # Extract claim text
+                    claim_text = claim_obj.get('text', '')
 
-                # Extract rating from first claimReview
-                claim_reviews = claim_obj.get('claimReview', [])
-                if not claim_reviews or len(claim_reviews) == 0:
-                    continue  # Skip claims without reviews
+                    # Extract rating from first claimReview
+                    claim_reviews = claim_obj.get('claimReview', [])
+                    if not claim_reviews or len(claim_reviews) == 0:
+                        continue  # Skip claims without reviews
 
-                textual_rating = claim_reviews[0].get('textualRating', '')
+                    textual_rating = claim_reviews[0].get('textualRating', '')
 
-                # Skip if missing required fields
-                if not claim_text or not textual_rating:
-                    continue
+                    # Skip if missing required fields
+                    if not claim_text or not textual_rating:
+                        continue
 
-                collected_claims.append({
-                    'claim_text': claim_text,
-                    'rating': textual_rating
-                })
+                    collected_claims.append({
+                        'claim_text': claim_text,
+                        'rating': textual_rating
+                    })
 
-            # Check for next page
-            page_token = data.get('nextPageToken')
-            if not page_token:
-                placeholder.success(f"Fetched {len(collected_claims)} claims (all pages processed)")
-                break
+                # Check for next page
+                page_token = data.get('nextPageToken')
+                if not page_token:
+                    break  # No more pages for this query, try next one
 
         placeholder.success(f"Successfully fetched {len(collected_claims)} claims from Google Fact Check API")
         return collected_claims
@@ -301,7 +324,7 @@ def process_and_map_google_claims(api_results):
     return google_df
 
 
-def run_google_benchmark(google_df, trained_models, vectorizer, selected_phase):
+def run_google_benchmark(google_df, trained_models, vectorizer, selected_phase, rnn_tokenizer=None):
     """
     Tests trained models on Google claims and calculates performance metrics.
     """
@@ -356,17 +379,55 @@ def run_google_benchmark(google_df, trained_models, vectorizer, selected_phase):
     results_list = []
 
     for model_name, model in trained_models.items():
-        try:
-            # Handle Naive Bayes with negative values (same as training)
-            if model_name == "Naive Bayes":
-                X_features_model = np.abs(X_features).astype(float)
-            else:
-                X_features_model = X_features
+        if model is None:
+            results_list.append({
+                'Model': model_name, 'Accuracy': 0, 'F1-Score': 0,
+                'Precision': 0, 'Recall': 0, 'Inference Latency (ms)': 9999
+            })
+            continue
 
-            # Measure inference time
-            start_inference = time.time()
-            y_pred = model.predict(X_features_model)
-            inference_time = (time.time() - start_inference) * 1000  # Convert to ms
+        try:
+            # --- ANN prediction ---
+            if model_name == "ANN":
+                X_ann_bench = X_features
+                if sparse.issparse(X_ann_bench):
+                    X_ann_bench = X_ann_bench.toarray()
+                elif isinstance(X_ann_bench, pd.DataFrame):
+                    X_ann_bench = X_ann_bench.values
+                
+                start_inference = time.time()
+                y_pred_prob = model.predict(X_ann_bench, verbose=0).flatten()
+                y_pred = (y_pred_prob >= 0.5).astype(int)
+                inference_time = (time.time() - start_inference) * 1000
+
+            # --- RNN prediction ---
+            elif model_name == "RNN (LSTM)":
+                if rnn_tokenizer is None:
+                    st.warning("RNN tokenizer not available for benchmark.")
+                    results_list.append({
+                        'Model': model_name, 'Accuracy': 0, 'F1-Score': 0,
+                        'Precision': 0, 'Recall': 0, 'Inference Latency (ms)': 9999
+                    })
+                    continue
+                X_rnn_bench, _ = prepare_rnn_data(X_raw.tolist(), tokenizer=rnn_tokenizer, fit=False)
+                
+                start_inference = time.time()
+                y_pred_prob = model.predict(X_rnn_bench, verbose=0).flatten()
+                y_pred = (y_pred_prob >= 0.5).astype(int)
+                inference_time = (time.time() - start_inference) * 1000
+
+            # --- Naive Bayes ---
+            elif model_name == "Naive Bayes":
+                X_features_model = np.abs(X_features).astype(float)
+                start_inference = time.time()
+                y_pred = model.predict(X_features_model)
+                inference_time = (time.time() - start_inference) * 1000
+
+            # --- Other ML models ---
+            else:
+                start_inference = time.time()
+                y_pred = model.predict(X_features)
+                inference_time = (time.time() - start_inference) * 1000
 
             # Calculate metrics
             accuracy = accuracy_score(y_true, y_pred) * 100
@@ -416,11 +477,23 @@ def scrape_data_by_date_range(start_date: pd.Timestamp, end_date: pd.Timestamp):
         placeholder.text(f"Fetching page {page_count}... Scraped {scraped_rows_count} claims so far.")
 
         try:
-            response = requests.get(current_url, timeout=15)
-            response.raise_for_status()
+            # Retry up to 3 times with increasing timeout
+            response = None
+            for attempt in range(3):
+                try:
+                    placeholder.text(f"Fetching page {page_count}... (attempt {attempt+1}/3) Scraped {scraped_rows_count} claims so far.")
+                    response = requests.get(current_url, timeout=60, headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                    })
+                    response.raise_for_status()
+                    break
+                except requests.exceptions.RequestException as retry_e:
+                    if attempt == 2:
+                        raise retry_e
+                    time.sleep(2 * (attempt + 1))
             soup = BeautifulSoup(response.text, "html.parser")
         except requests.exceptions.RequestException as e:
-            placeholder.error(f"Network Error during request: {e}. Stopping scrape.")
+            placeholder.error(f"Network Error after 3 attempts: {e}. Stopping scrape.")
             break
 
         rows_to_add = []
@@ -556,6 +629,50 @@ def apply_feature_extraction(X, phase, vectorizer=None):
         return X_features, None
     
     return None, None
+
+# ============================
+# 3b. DEEP LEARNING MODEL BUILDERS
+# ============================
+
+# RNN config constants
+RNN_MAX_WORDS = 10000
+RNN_MAX_LEN = 100
+
+def build_ann_model(input_dim):
+    """Builds a feedforward Artificial Neural Network for binary classification."""
+    model = Sequential([
+        Dense(128, activation='relu', input_shape=(input_dim,)),
+        Dropout(0.3),
+        Dense(64, activation='relu'),
+        Dropout(0.2),
+        Dense(32, activation='relu'),
+        Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+def build_rnn_model(vocab_size=RNN_MAX_WORDS, max_len=RNN_MAX_LEN):
+    """Builds a Bidirectional LSTM network for binary text classification."""
+    model = Sequential([
+        Embedding(vocab_size, 64, input_length=max_len),
+        Bidirectional(LSTM(64, return_sequences=False)),
+        Dropout(0.3),
+        Dense(32, activation='relu'),
+        Dropout(0.2),
+        Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+def prepare_rnn_data(X_texts, tokenizer=None, fit=True):
+    """Tokenizes and pads text data for RNN input."""
+    if tokenizer is None:
+        tokenizer = KerasTokenizer(num_words=RNN_MAX_WORDS, oov_token='<OOV>')
+    if fit:
+        tokenizer.fit_on_texts(X_texts)
+    sequences = tokenizer.texts_to_sequences(X_texts)
+    padded = pad_sequences(sequences, maxlen=RNN_MAX_LEN, padding='post', truncating='post')
+    return padded, tokenizer
 
 
 def evaluate_models(df: pd.DataFrame, selected_phase: str):
@@ -698,10 +815,140 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str):
                 "Training Time (s)": 0, "Inference Latency (ms)": 9999,
             }
 
-    # 5. TRAIN FINAL MODELS ON FULL DATASET (for Google benchmark)
+    # 5. DEEP LEARNING MODELS — ANN & RNN with K-Fold CV
+    early_stop = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True, verbose=0)
+    
+    # --- ANN K-Fold ---
+    st.caption(f"Training ANN with {N_SPLITS}-Fold CV...")
+    ann_fold_metrics = {
+        'accuracy': [], 'f1': [], 'precision': [], 'recall': [], 'train_time': [], 'inference_time': []
+    }
+    
+    for fold, (train_index, test_index) in enumerate(skf.split(X_features_full, y)):
+        try:
+            X_train_ann = X_features_full[train_index]
+            X_test_ann = X_features_full[test_index]
+            y_train_ann = y[train_index]
+            y_test_ann = y[test_index]
+            
+            # Convert sparse to dense if needed
+            if sparse.issparse(X_train_ann):
+                X_train_ann = X_train_ann.toarray()
+                X_test_ann = X_test_ann.toarray()
+            elif isinstance(X_train_ann, pd.DataFrame):
+                X_train_ann = X_train_ann.values if hasattr(X_train_ann, 'values') else np.array(X_train_ann)
+                X_test_ann = X_test_ann.values if hasattr(X_test_ann, 'values') else np.array(X_test_ann)
+            
+            # Apply SMOTE to training data
+            try:
+                smote = SMOTE(random_state=42, k_neighbors=min(3, min(np.bincount(y_train_ann)) - 1))
+                X_train_ann_sm, y_train_ann_sm = smote.fit_resample(X_train_ann, y_train_ann)
+            except:
+                X_train_ann_sm, y_train_ann_sm = X_train_ann, y_train_ann
+            
+            # Compute class weights
+            class_counts = np.bincount(y_train_ann_sm.astype(int))
+            total = len(y_train_ann_sm)
+            cw = {0: total / (2.0 * class_counts[0]) if class_counts[0] > 0 else 1.0,
+                  1: total / (2.0 * class_counts[1]) if len(class_counts) > 1 and class_counts[1] > 0 else 1.0}
+            
+            ann_model = build_ann_model(X_train_ann_sm.shape[1])
+            
+            start_time = time.time()
+            ann_model.fit(X_train_ann_sm, y_train_ann_sm, epochs=20, batch_size=32,
+                          validation_split=0.15, callbacks=[early_stop],
+                          class_weight=cw, verbose=0)
+            train_time = time.time() - start_time
+            
+            start_inference = time.time()
+            y_pred_prob = ann_model.predict(X_test_ann, verbose=0).flatten()
+            y_pred_ann = (y_pred_prob >= 0.5).astype(int)
+            inference_time = (time.time() - start_inference) * 1000
+            
+            ann_fold_metrics['accuracy'].append(accuracy_score(y_test_ann, y_pred_ann))
+            ann_fold_metrics['f1'].append(f1_score(y_test_ann, y_pred_ann, average='weighted', zero_division=0))
+            ann_fold_metrics['precision'].append(precision_score(y_test_ann, y_pred_ann, average='weighted', zero_division=0))
+            ann_fold_metrics['recall'].append(recall_score(y_test_ann, y_pred_ann, average='weighted', zero_division=0))
+            ann_fold_metrics['train_time'].append(train_time)
+            ann_fold_metrics['inference_time'].append(inference_time)
+        except Exception as e:
+            st.warning(f"ANN Fold {fold+1} failed: {e}")
+            for key in ann_fold_metrics: ann_fold_metrics[key].append(0)
+    
+    if ann_fold_metrics['accuracy']:
+        model_metrics["ANN"] = {
+            "Model": "ANN",
+            "Accuracy": np.mean(ann_fold_metrics['accuracy']) * 100,
+            "F1-Score": np.mean(ann_fold_metrics['f1']),
+            "Precision": np.mean(ann_fold_metrics['precision']),
+            "Recall": np.mean(ann_fold_metrics['recall']),
+            "Training Time (s)": round(np.mean(ann_fold_metrics['train_time']), 2),
+            "Inference Latency (ms)": round(np.mean(ann_fold_metrics['inference_time']), 2),
+        }
+    
+    # --- RNN (LSTM) K-Fold ---
+    st.caption(f"Training RNN (LSTM) with {N_SPLITS}-Fold CV...")
+    rnn_fold_metrics = {
+        'accuracy': [], 'f1': [], 'precision': [], 'recall': [], 'train_time': [], 'inference_time': []
+    }
+    rnn_tokenizer = None
+    
+    for fold, (train_index, test_index) in enumerate(skf.split(X_features_full, y)):
+        try:
+            X_train_text_rnn = [X_raw_list[i] for i in train_index]
+            X_test_text_rnn = [X_raw_list[i] for i in test_index]
+            y_train_rnn = y[train_index]
+            y_test_rnn = y[test_index]
+            
+            # Tokenize and pad
+            X_train_pad, rnn_tokenizer = prepare_rnn_data(X_train_text_rnn, tokenizer=None, fit=True)
+            X_test_pad, _ = prepare_rnn_data(X_test_text_rnn, tokenizer=rnn_tokenizer, fit=False)
+            
+            # Compute class weights for RNN (no SMOTE for sequential data)
+            class_counts_rnn = np.bincount(y_train_rnn.astype(int))
+            total_rnn = len(y_train_rnn)
+            cw_rnn = {0: total_rnn / (2.0 * class_counts_rnn[0]) if class_counts_rnn[0] > 0 else 1.0,
+                      1: total_rnn / (2.0 * class_counts_rnn[1]) if len(class_counts_rnn) > 1 and class_counts_rnn[1] > 0 else 1.0}
+            
+            rnn_model = build_rnn_model()
+            
+            start_time = time.time()
+            rnn_model.fit(X_train_pad, y_train_rnn, epochs=15, batch_size=32,
+                          validation_split=0.15, callbacks=[early_stop],
+                          class_weight=cw_rnn, verbose=0)
+            train_time = time.time() - start_time
+            
+            start_inference = time.time()
+            y_pred_prob_rnn = rnn_model.predict(X_test_pad, verbose=0).flatten()
+            y_pred_rnn = (y_pred_prob_rnn >= 0.5).astype(int)
+            inference_time = (time.time() - start_inference) * 1000
+            
+            rnn_fold_metrics['accuracy'].append(accuracy_score(y_test_rnn, y_pred_rnn))
+            rnn_fold_metrics['f1'].append(f1_score(y_test_rnn, y_pred_rnn, average='weighted', zero_division=0))
+            rnn_fold_metrics['precision'].append(precision_score(y_test_rnn, y_pred_rnn, average='weighted', zero_division=0))
+            rnn_fold_metrics['recall'].append(recall_score(y_test_rnn, y_pred_rnn, average='weighted', zero_division=0))
+            rnn_fold_metrics['train_time'].append(train_time)
+            rnn_fold_metrics['inference_time'].append(inference_time)
+        except Exception as e:
+            st.warning(f"RNN Fold {fold+1} failed: {e}")
+            for key in rnn_fold_metrics: rnn_fold_metrics[key].append(0)
+    
+    if rnn_fold_metrics['accuracy']:
+        model_metrics["RNN (LSTM)"] = {
+            "Model": "RNN (LSTM)",
+            "Accuracy": np.mean(rnn_fold_metrics['accuracy']) * 100,
+            "F1-Score": np.mean(rnn_fold_metrics['f1']),
+            "Precision": np.mean(rnn_fold_metrics['precision']),
+            "Recall": np.mean(rnn_fold_metrics['recall']),
+            "Training Time (s)": round(np.mean(rnn_fold_metrics['train_time']), 2),
+            "Inference Latency (ms)": round(np.mean(rnn_fold_metrics['inference_time']), 2),
+        }
+
+    # 6. TRAIN FINAL MODELS ON FULL DATASET (for Google benchmark)
     st.caption("Training final models on complete dataset for benchmarking...")
     trained_models_final = {}
 
+    # --- Final ML Models ---
     for name in models_to_run.keys():
         try:
             # Get fresh model instance
@@ -741,8 +988,50 @@ def evaluate_models(df: pd.DataFrame, selected_phase: str):
             st.warning(f"Failed to train final {name} model: {e}")
             trained_models_final[name] = None
 
+    # --- Final ANN Model ---
+    try:
+        st.caption("Training final ANN model...")
+        X_ann_full = X_features_full
+        if sparse.issparse(X_ann_full):
+            X_ann_full = X_ann_full.toarray()
+        elif isinstance(X_ann_full, pd.DataFrame):
+            X_ann_full = X_ann_full.values
+        
+        try:
+            smote_ann = SMOTE(random_state=42, k_neighbors=min(3, min(np.bincount(y)) - 1))
+            X_ann_sm, y_ann_sm = smote_ann.fit_resample(X_ann_full, y)
+        except:
+            X_ann_sm, y_ann_sm = X_ann_full, y
+        
+        final_ann = build_ann_model(X_ann_sm.shape[1])
+        final_ann.fit(X_ann_sm, y_ann_sm, epochs=20, batch_size=32,
+                      validation_split=0.1, callbacks=[early_stop], verbose=0)
+        trained_models_final["ANN"] = final_ann
+    except Exception as e:
+        st.warning(f"Failed to train final ANN model: {e}")
+        trained_models_final["ANN"] = None
+
+    # --- Final RNN Model ---
+    try:
+        st.caption("Training final RNN (LSTM) model...")
+        X_rnn_full, rnn_tokenizer_final = prepare_rnn_data(X_raw.tolist(), tokenizer=None, fit=True)
+        
+        class_counts_final = np.bincount(y.astype(int))
+        total_final = len(y)
+        cw_final = {0: total_final / (2.0 * class_counts_final[0]) if class_counts_final[0] > 0 else 1.0,
+                    1: total_final / (2.0 * class_counts_final[1]) if len(class_counts_final) > 1 and class_counts_final[1] > 0 else 1.0}
+        
+        final_rnn = build_rnn_model()
+        final_rnn.fit(X_rnn_full, y, epochs=15, batch_size=32,
+                      validation_split=0.1, callbacks=[early_stop],
+                      class_weight=cw_final, verbose=0)
+        trained_models_final["RNN (LSTM)"] = final_rnn
+    except Exception as e:
+        st.warning(f"Failed to train final RNN model: {e}")
+        trained_models_final["RNN (LSTM)"] = None
+
     results_list = list(model_metrics.values())
-    return pd.DataFrame(results_list), trained_models_final, vectorizer
+    return pd.DataFrame(results_list), trained_models_final, vectorizer, rnn_tokenizer_final if 'rnn_tokenizer_final' in dir() else rnn_tokenizer
 
 # ============================
 # 4. HUMOR & CRITIQUE FUNCTIONS
@@ -764,6 +1053,8 @@ def get_model_critique(best_model: str) -> str:
         "Decision Tree": ["The Decision Tree won by asking a series of simple yes/no questions until it got tired. It's transparent, slightly judgmental, and surprisingly effective.", "The Hierarchical Champion! It built a beautiful, intricate set of if/then statements. It's the most organized person in the office, and the accuracy shows it.", "Decision Tree victory! It achieved success by splitting the data until it couldn't be split anymore. A classic strategy in science and divorce."],
         "Logistic Regression": ["Logistic Regression: The veteran politician of ML. It draws a clean, straight line to victory. Boring, reliable, and hard to beat.", "The Straight-Line Stunner. It uses simple math to predict complex reality. It's predictable, efficient, and definitely got tenure.", "LogReg prevails! The model's philosophy is: 'Probability is all you need.' It's the safest bet, and the accuracy score agrees."],
         "SVM": ["SVM: It found the biggest, widest gap between the truth and the lies, and parked its hyperplane right there. Aggressive but effective boundary enforcement.", "The Maximizing Margin Master! SVM doesn't just separate classes; it builds a fortress between them. It's the most dramatic and highly paid algorithm here.", "SVM crushed it! It's the model that believes in extreme boundaries. No fuzzy logic, just a hard, clean, dividing line."],
+        "ANN": ["The Neural Network has spoken! It fired up 128 neurons, asked them to argue about politics, and somehow reached a consensus. Democracy works—even in hidden layers.", "ANN for the win! This feedforward overachiever has more layers than a political scandal. It learned patterns that even the data didn't know existed.", "The Artificial Neural Network proved that stacking layers of math on top of each other can solve anything. It's basically the corporate hierarchy of algorithms."],
+        "RNN (LSTM)": ["The LSTM remembers EVERYTHING. Every word, every sequence, every lie. It's the elephant of deep learning, and it just trampled the competition.", "RNN victory! This model read each statement word by word, like a suspicious detective reading a ransom note. Its memory is long and its judgment is harsh.", "The LSTM won by actually reading the sentences in order—what a revolutionary concept! While other models just counted words, this one understood the story."],
     }
     return random.choice(critiques.get(best_model, ["This model broke the simulation, so we have nothing funny to say."]))
 
@@ -799,895 +1090,1113 @@ def generate_humorous_critique(df_results: pd.DataFrame, selected_phase: str) ->
     return summary + roast
 
 # ============================
-# 5. STREAMLIT APP FUNCTION WITH SIDEBAR
+# 5. STREAMLIT APP — PREMIUM UI
 # ============================
 
 def app():
-    # --- Modern Theme Configuration ---
     st.set_page_config(
-        page_title='FactChecker: AI Fact-Checking Platform',
+        page_title='FactChecker — AI Fact-Checking Platform',
+        page_icon='🔍',
         layout='wide',
         initial_sidebar_state='expanded'
     )
 
-    # Custom CSS for Amazon Prime Inspired Dark Theme
+    # ─────────────────────────────────────────────
+    # PREMIUM CSS THEME — Glassmorphism Dark Mode
+    # ─────────────────────────────────────────────
     st.markdown("""
     <style>
-    /* Amazon Prime Inspired Dark Theme */
+    /* ── Google Font ── */
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+
+    /* ── CSS Variables ── */
     :root {
-        --prime-dark: #0f171e;
-        --prime-darker: #1a242f;
-        --prime-blue: #00a8e1;
-        --prime-light-blue: #00c8ff;
-        --prime-gray: #2a3f5f;
-        --prime-light-gray: #7a8ca0;
-        --prime-white: #ffffff;
-        --prime-text: #e6e6e6;
+        --bg-deep:        #06080f;
+        --bg-primary:     #0a0e1a;
+        --bg-card:        rgba(255,255,255,0.04);
+        --bg-card-hover:  rgba(255,255,255,0.07);
+        --glass-border:   rgba(255,255,255,0.08);
+        --glass-border-h: rgba(255,255,255,0.15);
+        --accent-indigo:  #6366f1;
+        --accent-violet:  #8b5cf6;
+        --accent-cyan:    #22d3ee;
+        --accent-emerald: #10b981;
+        --accent-amber:   #f59e0b;
+        --accent-rose:    #f43f5e;
+        --text-primary:   #f1f5f9;
+        --text-secondary: #94a3b8;
+        --text-muted:     #475569;
+        --shadow-lg:      0 20px 40px rgba(0,0,0,0.4);
+        --shadow-glow:    0 0 30px rgba(99,102,241,0.15);
     }
-    
-    /* Main content background - Prime Dark */
+
+    /* ── Global Reset ── */
+    *:not([class*="material"]):not([data-testid="stIconMaterial"]):not(.material-icons):not(.material-symbols-rounded),
+    *:not([class*="material"]):not([data-testid="stIconMaterial"]):not(.material-icons):not(.material-symbols-rounded)::before,
+    *:not([class*="material"]):not([data-testid="stIconMaterial"]):not(.material-icons):not(.material-symbols-rounded)::after {
+        font-family: 'Inter', sans-serif !important;
+    }
+
+    /* Restore Material Icons font */
+    .material-symbols-rounded,
+    .material-icons,
+    [data-testid="stIconMaterial"],
+    [class*="material-symbols"],
+    span[class*="material"] {
+        font-family: 'Material Symbols Rounded', 'Material Icons', sans-serif !important;
+    }
+
     .main .block-container {
-        background-color: var(--prime-dark) !important;
-        color: var(--prime-text) !important;
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+        max-width: 1200px;
     }
-    
-    /* Headers with Prime Blue accent */
-    h1, h2, h3, h4, h5, h6 {
-        color: var(--prime-white) !important;
-        font-weight: 600;
+
+    /* ── Sidebar ── */
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0c1021 0%, #0a0e1a 100%) !important;
+        border-right: 1px solid var(--glass-border) !important;
     }
-    
-    /* All text elements - Light Gray */
-    p, div, span, li, td, th, label, .stMarkdown, .stCaption, .stText {
-        color: var(--prime-text) !important;
-    }
-    
-    /* Sidebar styling - Darker Prime */
-    .css-1d391kg, .css-1lcbmhc, .sidebar .sidebar-content {
-        background-color: var(--prime-darker) !important;
-        color: var(--prime-text) !important;
-        border-right: 1px solid var(--prime-gray);
-    }
-    
-    /* Sidebar text */
-    .sidebar .sidebar-content * {
-        color: var(--prime-text) !important;
-    }
-    
-    /* Main header - Prime Blue Gradient */
-    .main-header {
-        background: linear-gradient(135deg, var(--prime-blue) 0%, var(--prime-light-blue) 100%);
-        padding: 2rem;
-        border-radius: 8px;
-        margin-bottom: 2rem;
-        box-shadow: 0 4px 12px rgba(0, 168, 225, 0.3);
-        border: none;
-    }
-    
-    .main-header h1 {
-        color: var(--prime-white) !important;
-        font-size: 2.5rem;
-        font-weight: 700;
-        margin-bottom: 0.5rem;
-        text-align: center;
-        text-shadow: 1px 1px 2px rgba(0,0,0,0.3);
-    }
-    
-    .main-header h3 {
-        color: var(--prime-white) !important;
-        font-size: 1.1rem;
-        text-align: center;
-        font-weight: 400;
-        opacity: 0.9;
-    }
-    
-    /* Cards - Dark Gray with subtle borders */
-    .card {
-        background: var(--prime-darker);
-        padding: 1.5rem;
-        border-radius: 8px;
-        border: 1px solid var(--prime-gray);
-        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-        margin-bottom: 1rem;
-        color: var(--prime-text) !important;
-        transition: all 0.3s ease;
-    }
-    
-    .card:hover {
-        border-color: var(--prime-blue);
-        box-shadow: 0 4px 16px rgba(0, 168, 225, 0.2);
-    }
-    
-    .card h3, .card h4, .card p, .card li, .card span, .card div {
-        color: var(--prime-text) !important;
-    }
-    
-    /* Metric cards - Prime Dark with Blue accent */
-    .metric-card {
-        background: var(--prime-darker);
-        padding: 1rem;
-        border-radius: 8px;
-        text-align: center;
-        border: 2px solid var(--prime-blue);
-        color: var(--prime-text) !important;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-        transition: all 0.3s ease;
-    }
-    
-    .metric-card:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 4px 16px rgba(0, 168, 225, 0.3);
-    }
-    
-    .metric-card h3, .metric-card h2, .metric-card p {
-        color: var(--prime-text) !important;
-        margin: 0.5rem 0;
-    }
-    
-    .metric-card h2 {
-        color: var(--prime-blue) !important;
-        font-size: 1.8rem;
-        font-weight: 700;
-    }
-    
-    /* Buttons - Prime Blue Gradient */
-    .stButton>button {
-        background: linear-gradient(135deg, var(--prime-blue) 0%, var(--prime-light-blue) 100%);
-        color: var(--prime-white) !important;
-        border: none;
-        padding: 0.7rem 1.5rem;
-        border-radius: 6px;
-        font-weight: 600;
-        transition: all 0.3s ease;
-        width: 100%;
-        box-shadow: 0 2px 6px rgba(0, 168, 225, 0.3);
-    }
-    
-    .stButton>button:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 4px 12px rgba(0, 168, 225, 0.4);
-        color: var(--prime-white) !important;
-    }
-    
-    /* Feature pills - Prime Blue */
-    .feature-pill {
-        background: var(--prime-blue);
-        color: var(--prime-white) !important;
-        padding: 0.3rem 0.8rem;
+    [data-testid="stSidebar"] * { color: var(--text-secondary) !important; }
+    [data-testid="stSidebar"] .stRadio label { font-weight: 500 !important; }
+    [data-testid="stSidebar"] .stRadio label:hover { color: var(--text-primary) !important; }
+    [data-testid="stSidebar"] hr { border-color: var(--glass-border) !important; }
+
+    /* ── Headers ── */
+    h1 { color: var(--text-primary) !important; font-weight: 800 !important; letter-spacing: -0.03em; }
+    h2 { color: var(--text-primary) !important; font-weight: 700 !important; letter-spacing: -0.02em; }
+    h3 { color: var(--text-primary) !important; font-weight: 600 !important; }
+    h4, h5, h6 { color: var(--text-secondary) !important; }
+
+    /* ── Body text ── */
+    p, li, span, div { color: var(--text-secondary) !important; }
+
+    /* ── Hero Banner ── */
+    .hero-banner {
+        background: linear-gradient(135deg, #1e1b4b 0%, #312e81 30%, #4338ca 60%, #6366f1 100%);
+        padding: 2.5rem 2.5rem;
         border-radius: 16px;
-        font-size: 0.8rem;
-        margin: 0.2rem;
-        display: inline-block;
-        border: 1px solid var(--prime-light-blue);
+        margin-bottom: 2rem;
+        position: relative;
+        overflow: hidden;
+        box-shadow: var(--shadow-glow), var(--shadow-lg);
     }
-    
-    /* Status boxes - Dark with colored borders */
-    .success-box {
-        background: rgba(34, 197, 94, 0.1);
-        color: var(--prime-text) !important;
-        padding: 1rem;
-        border-radius: 6px;
-        margin: 1rem 0;
-        border: 1px solid #22c55e;
+    .hero-banner::before {
+        content: '';
+        position: absolute;
+        top: -50%;
+        right: -30%;
+        width: 500px;
+        height: 500px;
+        background: radial-gradient(circle, rgba(139,92,246,0.2) 0%, transparent 70%);
+        border-radius: 50%;
     }
-    
-    .warning-box {
-        background: rgba(245, 158, 11, 0.1);
-        color: var(--prime-text) !important;
-        padding: 1rem;
-        border-radius: 6px;
-        margin: 1rem 0;
-        border: 1px solid #f59e0b;
+    .hero-banner::after {
+        content: '';
+        position: absolute;
+        bottom: -40%;
+        left: -20%;
+        width: 400px;
+        height: 400px;
+        background: radial-gradient(circle, rgba(34,211,238,0.1) 0%, transparent 70%);
+        border-radius: 50%;
     }
-    
-    .info-box {
-        background: rgba(59, 130, 246, 0.1);
-        color: var(--prime-text) !important;
-        padding: 1rem;
-        border-radius: 6px;
-        margin: 1rem 0;
-        border: 1px solid var(--prime-blue);
+    .hero-banner h1 {
+        color: #ffffff !important;
+        font-size: 2.4rem !important;
+        margin-bottom: 0.3rem;
+        position: relative;
+        z-index: 1;
     }
-    
-    /* Dataframes and tables - Dark theme */
-    .dataframe {
-        color: var(--prime-text) !important;
-        background-color: var(--prime-darker) !important;
-        border: 1px solid var(--prime-gray);
+    .hero-banner p {
+        color: rgba(255,255,255,0.8) !important;
+        font-size: 1.05rem;
+        font-weight: 400;
+        position: relative;
+        z-index: 1;
+        margin: 0;
     }
-    
-    .dataframe th {
-        background-color: var(--prime-blue) !important;
-        color: var(--prime-white) !important;
+
+    /* ── Glass Card ── */
+    .glass-card {
+        background: var(--bg-card);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        border: 1px solid var(--glass-border);
+        border-radius: 14px;
+        padding: 1.6rem;
+        margin-bottom: 1rem;
+        transition: all 0.3s cubic-bezier(0.4,0,0.2,1);
+    }
+    .glass-card:hover {
+        background: var(--bg-card-hover);
+        border-color: var(--glass-border-h);
+        transform: translateY(-2px);
+        box-shadow: var(--shadow-glow);
+    }
+    .glass-card h3 { margin-top: 0; font-size: 1.15rem; }
+    .glass-card p  { font-size: 0.92rem; line-height: 1.6; }
+
+    /* ── KPI Metric Card ── */
+    .kpi-card {
+        background: var(--bg-card);
+        backdrop-filter: blur(12px);
+        border: 1px solid var(--glass-border);
+        border-radius: 14px;
+        padding: 1.3rem 1.5rem;
+        text-align: center;
+        transition: all 0.35s cubic-bezier(0.4,0,0.2,1);
+        position: relative;
+        overflow: hidden;
+    }
+    .kpi-card::before {
+        content: '';
+        position: absolute;
+        top: 0; left: 0; right: 0;
+        height: 3px;
+        border-radius: 14px 14px 0 0;
+    }
+    .kpi-card.indigo::before { background: linear-gradient(90deg, var(--accent-indigo), var(--accent-violet)); }
+    .kpi-card.emerald::before { background: linear-gradient(90deg, #059669, var(--accent-emerald)); }
+    .kpi-card.cyan::before { background: linear-gradient(90deg, #0891b2, var(--accent-cyan)); }
+    .kpi-card.amber::before { background: linear-gradient(90deg, #d97706, var(--accent-amber)); }
+    .kpi-card.rose::before { background: linear-gradient(90deg, #e11d48, var(--accent-rose)); }
+    .kpi-card.violet::before { background: linear-gradient(90deg, #7c3aed, var(--accent-violet)); }
+
+    .kpi-card:hover {
+        transform: translateY(-4px);
+        box-shadow: 0 12px 28px rgba(0,0,0,0.35);
+        border-color: var(--glass-border-h);
+    }
+    .kpi-card .kpi-icon { font-size: 1.6rem; margin-bottom: 0.3rem; }
+    .kpi-card .kpi-value {
+        font-size: 1.9rem;
+        font-weight: 800;
+        color: var(--text-primary) !important;
+        letter-spacing: -0.03em;
+        line-height: 1.2;
+    }
+    .kpi-card .kpi-label {
+        font-size: 0.78rem;
+        color: var(--text-muted) !important;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
         font-weight: 600;
-        border: 1px solid var(--prime-gray);
+        margin-top: 0.3rem;
     }
-    
-    .dataframe td {
-        background-color: var(--prime-darker) !important;
-        color: var(--prime-text) !important;
-        border: 1px solid var(--prime-gray);
+
+    /* ── Pipeline Stepper ── */
+    .pipeline-stepper {
+        display: flex;
+        gap: 0;
+        margin: 1.5rem 0;
     }
-    
-    /* Streamlit native elements */
-    .stSelectbox, .stSlider, .stDateInput, .stRadio {
-        color: var(--prime-text) !important;
+    .step-item {
+        flex: 1;
+        text-align: center;
+        padding: 1rem 0.5rem;
+        position: relative;
     }
-    
-    .stSelectbox label, .stSlider label, .stDateInput label, .stRadio label {
-        color: var(--prime-text) !important;
-        font-weight: 500;
+    .step-item::after {
+        content: '';
+        position: absolute;
+        top: 28px;
+        right: -50%;
+        width: 100%;
+        height: 2px;
+        background: var(--glass-border);
+        z-index: 0;
     }
-    
-    /* Input fields */
-    .stTextInput input, .stNumberInput input, .stTextArea textarea {
-        background-color: var(--prime-darker) !important;
-        color: var(--prime-text) !important;
-        border: 1px solid var(--prime-gray) !important;
-    }
-    
-    /* Expander */
-    .streamlit-expanderHeader {
-        background-color: var(--prime-darker) !important;
-        color: var(--prime-text) !important;
-        font-weight: 600;
-        border: 1px solid var(--prime-gray);
-    }
-    
-    /* Progress bars */
-    .stProgress > div > div {
-        background-color: var(--prime-blue) !important;
-    }
-    
-    /* Radio and checkbox labels */
-    .stRadio label, .stCheckbox label {
-        color: var(--prime-text) !important;
-    }
-    
-    /* Metric containers */
-    [data-testid="metric-container"] {
-        color: var(--prime-text) !important;
-        background-color: var(--prime-darker) !important;
-    }
-    
-    [data-testid="metric-container"] label {
-        color: var(--prime-text) !important;
-        font-weight: 500;
-    }
-    
-    [data-testid="metric-container"] div {
-        color: var(--prime-blue) !important;
+    .step-item:last-child::after { display: none; }
+    .step-dot {
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 0.95rem;
         font-weight: 700;
+        position: relative;
+        z-index: 1;
+        margin-bottom: 0.5rem;
+        transition: all 0.3s ease;
     }
-    
-    /* Make ALL text consistent in main content */
-    .main * {
-        color: var(--prime-text) !important;
+    .step-dot.done {
+        background: linear-gradient(135deg, var(--accent-emerald), #34d399);
+        color: #fff !important;
+        box-shadow: 0 0 12px rgba(16,185,129,0.4);
     }
-    
-    /* Specific styling for charts */
-    .stChart {
-        background-color: var(--prime-darker) !important;
+    .step-dot.active {
+        background: linear-gradient(135deg, var(--accent-indigo), var(--accent-violet));
+        color: #fff !important;
+        box-shadow: 0 0 14px rgba(99,102,241,0.5);
+        animation: pulse-ring 2s ease-in-out infinite;
     }
-    
-    /* Divider lines */
-    hr {
-        border-color: var(--prime-gray) !important;
+    .step-dot.pending {
+        background: rgba(255,255,255,0.06);
+        border: 2px solid var(--glass-border);
+        color: var(--text-muted) !important;
     }
+    .step-label {
+        font-size: 0.72rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--text-muted) !important;
+    }
+    .step-item.completed .step-label { color: var(--accent-emerald) !important; }
+    .step-item.is-active .step-label { color: var(--accent-indigo) !important; }
+
+    /* ── Podium Cards ── */
+    .podium-card {
+        background: var(--bg-card);
+        backdrop-filter: blur(12px);
+        border: 1px solid var(--glass-border);
+        border-radius: 14px;
+        padding: 1.5rem;
+        text-align: center;
+        transition: all 0.3s ease;
+    }
+    .podium-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-glow); }
+    .podium-card.gold   { border-color: #fbbf24; box-shadow: 0 0 20px rgba(251,191,36,0.15); }
+    .podium-card.silver { border-color: #94a3b8; }
+    .podium-card.bronze { border-color: #d97706; }
+    .podium-medal { font-size: 2.2rem; margin-bottom: 0.3rem; }
+    .podium-name { font-size: 1rem; font-weight: 700; color: var(--text-primary) !important; }
+    .podium-score { font-size: 1.6rem; font-weight: 800; color: var(--accent-indigo) !important; margin: 0.3rem 0; }
+    .podium-sub { font-size: 0.78rem; color: var(--text-muted) !important; }
+
+    /* ── Phase Card ── */
+    .phase-card {
+        background: var(--bg-card);
+        backdrop-filter: blur(12px);
+        border: 1px solid var(--glass-border);
+        border-radius: 12px;
+        padding: 1rem 1.2rem;
+        margin-bottom: 0.6rem;
+        display: flex;
+        align-items: center;
+        gap: 0.8rem;
+        transition: all 0.25s ease;
+        cursor: default;
+    }
+    .phase-card:hover {
+        background: var(--bg-card-hover);
+        border-color: var(--accent-indigo);
+    }
+    .phase-icon { font-size: 1.5rem; }
+    .phase-name { font-weight: 600; font-size: 0.9rem; color: var(--text-primary) !important; }
+    .phase-desc { font-size: 0.78rem; color: var(--text-muted) !important; }
+
+    /* ── Status Badge ── */
+    .status-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        font-size: 0.78rem;
+        font-weight: 600;
+        padding: 0.25rem 0.7rem;
+        border-radius: 20px;
+        letter-spacing: 0.03em;
+    }
+    .status-badge.ready { background: rgba(16,185,129,0.15); color: #34d399 !important; }
+    .status-badge.pending { background: rgba(245,158,11,0.15); color: #fbbf24 !important; }
+    .status-badge.error { background: rgba(244,63,94,0.12); color: #fb7185 !important; }
+
+    /* ── Buttons ── */
+    .stButton>button {
+        background: linear-gradient(135deg, var(--accent-indigo) 0%, var(--accent-violet) 100%) !important;
+        color: #ffffff !important;
+        border: none !important;
+        padding: 0.65rem 1.5rem !important;
+        border-radius: 10px !important;
+        font-weight: 600 !important;
+        font-size: 0.9rem !important;
+        letter-spacing: 0.01em;
+        transition: all 0.3s cubic-bezier(0.4,0,0.2,1) !important;
+        box-shadow: 0 4px 14px rgba(99,102,241,0.3) !important;
+    }
+    .stButton>button:hover {
+        transform: translateY(-2px) !important;
+        box-shadow: 0 8px 22px rgba(99,102,241,0.4) !important;
+    }
+    .stButton>button:active { transform: translateY(0) !important; }
+
+    /* ── Selectbox / Inputs ── */
+    .stSelectbox > div > div,
+    .stTextInput > div > div > input,
+    .stNumberInput > div > div > input,
+    .stDateInput > div > div > input {
+        background-color: rgba(255,255,255,0.04) !important;
+        border: 1px solid var(--glass-border) !important;
+        border-radius: 10px !important;
+        color: var(--text-primary) !important;
+    }
+    .stSelectbox label, .stSlider label, .stDateInput label, .stRadio label, .stCheckbox label {
+        color: var(--text-secondary) !important;
+        font-weight: 500 !important;
+    }
+
+    /* ── Dataframe ── */
+    .stDataFrame { border-radius: 12px; overflow: hidden; }
+
+    /* ── Tabs ── */
+    .stTabs [data-baseweb="tab-list"] { gap: 0; border-bottom: 1px solid var(--glass-border); }
+    .stTabs [data-baseweb="tab"] {
+        color: var(--text-muted) !important;
+        font-weight: 600;
+        padding: 0.6rem 1.2rem;
+        border-radius: 8px 8px 0 0;
+        background: transparent;
+    }
+    .stTabs [aria-selected="true"] {
+        color: var(--accent-indigo) !important;
+        border-bottom: 2px solid var(--accent-indigo);
+        background: rgba(99,102,241,0.06);
+    }
+
+    /* ── Expander ── */
+    .streamlit-expanderHeader {
+        background: var(--bg-card) !important;
+        border: 1px solid var(--glass-border) !important;
+        border-radius: 10px !important;
+        color: var(--text-secondary) !important;
+        font-weight: 600 !important;
+    }
+
+    /* ── Metrics ── */
+    [data-testid="metric-container"] {
+        background: var(--bg-card) !important;
+        border: 1px solid var(--glass-border) !important;
+        border-radius: 12px !important;
+        padding: 0.8rem 1rem !important;
+    }
+    [data-testid="metric-container"] label { color: var(--text-secondary) !important; font-weight: 500 !important; }
+    [data-testid="metric-container"] [data-testid="stMetricValue"] { color: var(--text-primary) !important; font-weight: 700 !important; }
+
+    /* ── Divider ── */
+    hr { border-color: var(--glass-border) !important; margin: 1.5rem 0 !important; }
+
+    /* ── Critique / Quote Card ── */
+    .critique-card {
+        background: linear-gradient(135deg, rgba(99,102,241,0.08) 0%, rgba(139,92,246,0.05) 100%);
+        border: 1px solid rgba(99,102,241,0.2);
+        border-left: 4px solid var(--accent-indigo);
+        border-radius: 0 14px 14px 0;
+        padding: 1.5rem 1.8rem;
+        margin: 1rem 0;
+    }
+    .critique-card p, .critique-card li, .critique-card h3 { color: var(--text-secondary) !important; }
+    .critique-card strong { color: var(--text-primary) !important; }
+
+    /* ── Animations ── */
+    @keyframes pulse-ring {
+        0%   { box-shadow: 0 0 0 0 rgba(99,102,241,0.4); }
+        70%  { box-shadow: 0 0 0 8px rgba(99,102,241,0); }
+        100% { box-shadow: 0 0 0 0 rgba(99,102,241,0); }
+    }
+    @keyframes fade-in-up {
+        from { opacity: 0; transform: translateY(16px); }
+        to   { opacity: 1; transform: translateY(0); }
+    }
+    .animate-in {
+        animation: fade-in-up 0.5s cubic-bezier(0.4,0,0.2,1) both;
+    }
+    .animate-in-d1 { animation-delay: 0.1s; }
+    .animate-in-d2 { animation-delay: 0.2s; }
+    .animate-in-d3 { animation-delay: 0.3s; }
+    .animate-in-d4 { animation-delay: 0.4s; }
+
+    /* ── Plotly Chart container ── */
+    .js-plotly-plot .plotly .main-svg { border-radius: 12px; }
+
     </style>
     """, unsafe_allow_html=True)
 
-    # --- State Management ---
-    if 'scraped_df' not in st.session_state:
-        st.session_state['scraped_df'] = pd.DataFrame()
-    if 'df_results' not in st.session_state:
-        st.session_state['df_results'] = pd.DataFrame()
-    if 'trained_models' not in st.session_state:
-        st.session_state['trained_models'] = {}
-    if 'trained_vectorizer' not in st.session_state:
-        st.session_state['trained_vectorizer'] = None
-    if 'google_benchmark_results' not in st.session_state:
-        st.session_state['google_benchmark_results'] = pd.DataFrame()
-    if 'google_df' not in st.session_state:
-        st.session_state['google_df'] = pd.DataFrame()
-    if 'dark_mode' not in st.session_state:
-        st.session_state['dark_mode'] = True  # Default to dark mode
+    # ─────────────────────────────────────────────
+    # SESSION STATE
+    # ─────────────────────────────────────────────
+    defaults = {
+        'scraped_df': pd.DataFrame(),
+        'df_results': pd.DataFrame(),
+        'trained_models': {},
+        'trained_vectorizer': None,
+        'rnn_tokenizer': None,
+        'google_benchmark_results': pd.DataFrame(),
+        'google_df': pd.DataFrame(),
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    # ============================
-    # SIDEBAR NAVIGATION
-    # ============================
-    
-    st.sidebar.markdown("""
-    <div style='text-align: center; padding: 1rem 0; border-bottom: 1px solid #2a3f5f; margin-bottom: 1rem;'>
-        <h2 style='color: #00a8e1; margin-bottom: 0.5rem; font-weight: 700;'>FactChecker</h2>
-        <p style='color: #7a8ca0; font-size: 0.9rem; margin: 0; font-weight: 400;'>AI-Powered Fact-Checking Platform</p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Dark Mode Toggle
-    dark_mode = st.sidebar.toggle("🌙 Dark Mode", value=st.session_state['dark_mode'], key='dark_mode_toggle')
-    st.session_state['dark_mode'] = dark_mode
-    
-    # Apply dynamic theme CSS
-    if st.session_state['dark_mode']:
-        # Dark Theme CSS
+    # ─────────────────────────────────────────────
+    # SIDEBAR
+    # ─────────────────────────────────────────────
+    with st.sidebar:
+        # Brand
         st.markdown("""
-        <style>
-        :root {
-            --bg-primary: #0f171e;
-            --bg-secondary: #1a242f;
-            --accent: #00a8e1;
-            --accent-light: #00c8ff;
-            --border: #2a3f5f;
-            --text-primary: #ffffff;
-            --text-secondary: #e6e6e6;
-            --text-muted: #7a8ca0;
-        }
-        .main .block-container { background-color: var(--bg-primary) !important; }
-        h1, h2, h3, h4, h5, h6 { color: var(--text-primary) !important; }
-        p, div, span, li, td, th, label { color: var(--text-secondary) !important; }
-        [data-testid="stSidebar"] { background-color: var(--bg-secondary) !important; }
-        [data-testid="stSidebar"] * { color: var(--text-primary) !important; }
-        .card { background: var(--bg-secondary); border: 1px solid var(--border); color: var(--text-secondary) !important; }
-        .main-header { background: linear-gradient(135deg, var(--accent) 0%, var(--accent-light) 100%); }
-        .stButton>button { background: linear-gradient(135deg, var(--accent) 0%, var(--accent-light) 100%); color: var(--text-primary) !important; }
-        .dataframe { background-color: var(--bg-secondary) !important; color: var(--text-secondary) !important; }
-        .dataframe th { background-color: var(--accent) !important; color: var(--text-primary) !important; }
-        .dataframe td { background-color: var(--bg-secondary) !important; color: var(--text-secondary) !important; }
-        .stTextInput input, .stNumberInput input, .stTextArea textarea { background-color: var(--bg-secondary) !important; color: var(--text-secondary) !important; border: 1px solid var(--border) !important; }
-        [data-testid="metric-container"] { background-color: var(--bg-secondary) !important; }
-        [data-testid="metric-container"] label { color: var(--text-secondary) !important; }
-        [data-testid="metric-container"] div { color: var(--accent) !important; }
-        </style>
-        """, unsafe_allow_html=True)
-    else:
-        # Light Theme CSS
-        st.markdown("""
-        <style>
-        :root {
-            --bg-primary: #ffffff;
-            --bg-secondary: #f8f9fa;
-            --accent: #0066cc;
-            --accent-light: #3399ff;
-            --border: #dee2e6;
-            --text-primary: #212529;
-            --text-secondary: #495057;
-            --text-muted: #6c757d;
-        }
-        .main .block-container { background-color: var(--bg-primary) !important; }
-        h1, h2, h3, h4, h5, h6 { color: var(--text-primary) !important; }
-        p, div, span, li, td, th, label { color: var(--text-secondary) !important; }
-        [data-testid="stSidebar"] { background-color: var(--bg-secondary) !important; }
-        [data-testid="stSidebar"] * { color: var(--text-primary) !important; }
-        .card { background: var(--bg-secondary); border: 1px solid var(--border); color: var(--text-secondary) !important; padding: 1.5rem; border-radius: 8px; margin-bottom: 1rem; }
-        .main-header { background: linear-gradient(135deg, var(--accent) 0%, var(--accent-light) 100%); padding: 2rem; border-radius: 8px; margin-bottom: 2rem; }
-        .main-header h1, .main-header h3 { color: #ffffff !important; }
-        .stButton>button { background: linear-gradient(135deg, var(--accent) 0%, var(--accent-light) 100%); color: #ffffff !important; border: none; padding: 0.7rem 1.5rem; border-radius: 6px; }
-        .dataframe { background-color: var(--bg-secondary) !important; color: var(--text-secondary) !important; }
-        .dataframe th { background-color: var(--accent) !important; color: #ffffff !important; }
-        .dataframe td { background-color: var(--bg-primary) !important; color: var(--text-secondary) !important; }
-        .stTextInput input, .stNumberInput input, .stTextArea textarea { background-color: var(--bg-primary) !important; color: var(--text-secondary) !important; border: 1px solid var(--border) !important; }
-        [data-testid="metric-container"] { background-color: var(--bg-secondary) !important; }
-        [data-testid="metric-container"] label { color: var(--text-secondary) !important; }
-        [data-testid="metric-container"] div { color: var(--accent) !important; }
-        </style>
-        """, unsafe_allow_html=True)
-    
-    # Navigation
-    page = st.sidebar.radio(
-        "Navigation",
-        ["Dashboard", "Data Collection", "Model Training", "Benchmark Testing", "Results & Analysis"],
-        key='navigation'
-    )
-    
-    # Sidebar info panel
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### System Status")
-    
-    # Status indicators
-    data_status = "Ready" if not st.session_state['scraped_df'].empty else "No Data"
-    models_status = "Trained" if st.session_state['trained_models'] else "Not Trained"
-    benchmark_status = "Complete" if not st.session_state['google_benchmark_results'].empty else "Pending"
-    
-    st.sidebar.markdown(f"""
-    - **Data**: {data_status}
-    - **Models**: {models_status}
-    - **Benchmark**: {benchmark_status}
-    """)
-    
-    # Quick actions in sidebar
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### Quick Actions")
-    
-    if st.sidebar.button("Clear All Data", key="sidebar_clear"):
-        st.session_state.clear()
-        st.rerun()
-    
-    # Feature descriptions expander
-    with st.sidebar.expander("Feature Descriptions"):
-        st.markdown("""
-        **Lexical & Morphological**
-        - Word-level analysis
-        - Lemmatization & stopwords
-        - N-gram features
-        
-        **Syntactic**
-        - Grammar structure
-        - Part-of-speech tags
-        - Sentence patterns
-        
-        **Semantic**
-        - Sentiment analysis
-        - Polarity & subjectivity
-        - Meaning extraction
-        
-        **Discourse**
-        - Text structure
-        - Sentence count
-        - Discourse markers
-        
-        **Pragmatic**
-        - Intent analysis
-        - Modal verbs
-        - Emphasis markers
-        """)
-    
-    # ============================
-    # PAGE CONTENT BASED ON NAVIGATION
-    # ============================
-    
-    # DASHBOARD PAGE
-    if page == "Dashboard":
-        st.markdown("""
-        <div class="main-header">
-            <h1>FactChecker Dashboard</h1>
-            <h3>Comprehensive AI-Powered Fact-Checking & Misinformation Detection</h3>
+        <div style='text-align:center; padding:1.2rem 0 1rem;'>
+            <div style='font-size:2rem; margin-bottom:0.2rem;'>🔍</div>
+            <div style='font-size:1.3rem; font-weight:800; letter-spacing:-0.02em;
+                        background:linear-gradient(135deg,#6366f1,#a78bfa);
+                        -webkit-background-clip:text; -webkit-text-fill-color:transparent;'>FactChecker</div>
+            <div style='font-size:0.72rem; color:#64748b !important; text-transform:uppercase;
+                        letter-spacing:0.1em; font-weight:600; margin-top:0.2rem;'>AI Fact-Checking Platform</div>
         </div>
         """, unsafe_allow_html=True)
-        
-        # Dashboard overview
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.markdown("""
-            <div class="card">
-                <h3>Data Overview</h3>
-                <p>Collect and manage training data from Politifact archives</p>
-                <ul>
-                    <li>Web scraping capabilities</li>
-                    <li>Date range selection</li>
-                    <li>Real-time data validation</li>
-                </ul>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown("""
-            <div class="card">
-                <h3>Model Training</h3>
-                <p>Advanced NLP feature extraction and ML training</p>
-                <ul>
-                    <li>5 feature extraction methods</li>
-                    <li>4 machine learning models</li>
-                    <li>Cross-validation & SMOTE</li>
-                </ul>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with col3:
-            st.markdown("""
-            <div class="card">
-                <h3>Benchmark Testing</h3>
-                <p>Real-world performance validation</p>
-                <ul>
-                    <li>Google Fact Check API</li>
-                    <li>Live fact-check data</li>
-                    <li>Performance comparison</li>
-                </ul>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        # Quick start guide
+
         st.markdown("---")
-        st.header("Getting Started Guide")
-        
-        guide_col1, guide_col2 = st.columns(2)
-        
-        with guide_col1:
+
+        # Navigation
+        page = st.radio(
+            "NAVIGATE",
+            ["🏠  Dashboard", "📥  Data Collection", "🧠  Model Training",
+             "🎯  Benchmark Testing", "📊  Results & Analysis"],
+            key='navigation',
+            label_visibility='collapsed'
+        )
+
+        st.markdown("---")
+
+        # Pipeline progress
+        has_data = not st.session_state['scraped_df'].empty
+        has_models = bool(st.session_state['trained_models'])
+        has_bench = not st.session_state['google_benchmark_results'].empty
+        has_results = not st.session_state['df_results'].empty
+
+        st.markdown("##### ⚙️ Pipeline Status")
+
+        def _badge(label, ok):
+            cls = "ready" if ok else "pending"
+            dot = "●" if ok else "○"
+            return f'<span class="status-badge {cls}">{dot} {label}</span>'
+
+        st.markdown(
+            f"""<div style='display:flex; flex-direction:column; gap:0.45rem; margin:0.5rem 0 0.8rem;'>
+            {_badge("Data Collected", has_data)}
+            {_badge("Models Trained", has_models)}
+            {_badge("Benchmark Run", has_bench)}
+            {_badge("Results Ready", has_results)}
+            </div>""",
+            unsafe_allow_html=True
+        )
+
+        st.markdown("---")
+
+        # Quick actions
+        if st.button("🗑️  Clear All Data", key="sidebar_clear", use_container_width=True):
+            st.session_state.clear()
+            st.rerun()
+
+        # Feature reference
+        with st.expander("📚 Feature Reference"):
             st.markdown("""
-            <div class="card">
-            <h3>Quick Start</h3>
-            <ol>
-                <li><strong>Data Collection</strong>: Navigate to Data Collection tab and scrape Politifact data</li>
-                <li><strong>Model Training</strong>: Go to Model Training and configure your analysis</li>
-                <li><strong>Benchmark Testing</strong>: Validate models with real-world data</li>
-                <li><strong>Results Analysis</strong>: Review performance metrics and insights</li>
-            </ol>
-            </div>
-            """, unsafe_allow_html=True)
-        
-        with guide_col2:
-            st.markdown("""
-            <div class="card">
-            <h3>Current Status</h3>
-            """, unsafe_allow_html=True)
-            
-            # Dynamic status display
-            if not st.session_state['scraped_df'].empty:
-                st.success(f"Data: {len(st.session_state['scraped_df'])} claims loaded")
-            else:
-                st.warning("Data: No data collected yet")
-                
-            if st.session_state['trained_models']:
-                st.success(f"Models: {len(st.session_state['trained_models'])} models trained")
-            else:
-                st.warning("Models: No models trained yet")
-                
-            if not st.session_state['google_benchmark_results'].empty:
-                st.success("Benchmark: Testing complete")
-            else:
-                st.info("Benchmark: Ready for testing")
-            
-            st.markdown("</div>", unsafe_allow_html=True)
-    
-    # DATA COLLECTION PAGE
-    elif page == "Data Collection":
+            **Lexical & Morphological**
+            Lemmatization · Stopwords · N-grams
+
+            **Syntactic**
+            POS tags · Grammar patterns
+
+            **Semantic**
+            Sentiment polarity · Subjectivity
+
+            **Discourse**
+            Sentence count · Discourse markers
+
+            **Pragmatic**
+            Modal verbs · Intent signals
+            """)
+
+    # ─────────────────────────────────────────────
+    # PAGE ROUTING
+    # ─────────────────────────────────────────────
+
+    # ╔══════════════════════════════════════════╗
+    # ║           DASHBOARD  PAGE                ║
+    # ╚══════════════════════════════════════════╝
+    if "Dashboard" in page:
+        # Hero
         st.markdown("""
-        <div class="main-header">
-            <h1>Data Collection</h1>
-            <h3>Gather Training Data from Politifact Archives</h3>
+        <div class="hero-banner animate-in">
+            <h1>🔍 FactChecker Dashboard</h1>
+            <p>AI-powered misinformation detection with NLP feature engineering & multi-model evaluation</p>
         </div>
         """, unsafe_allow_html=True)
-        
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.subheader("Politifact Archive Scraper")
-            
+
+        # KPI Cards
+        total_claims = len(st.session_state['scraped_df']) if has_data else 0
+        models_count = len(st.session_state['trained_models']) if has_models else 0
+        best_acc = f"{st.session_state['df_results']['Accuracy'].max():.1f}%" if has_results and not st.session_state['df_results'].empty else "—"
+        bench_count = len(st.session_state['google_df']) if has_bench else 0
+
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            st.markdown(f"""
+            <div class="kpi-card indigo animate-in animate-in-d1">
+                <div class="kpi-icon">📄</div>
+                <div class="kpi-value">{total_claims}</div>
+                <div class="kpi-label">Claims Collected</div>
+            </div>""", unsafe_allow_html=True)
+        with k2:
+            st.markdown(f"""
+            <div class="kpi-card emerald animate-in animate-in-d2">
+                <div class="kpi-icon">🤖</div>
+                <div class="kpi-value">{models_count}</div>
+                <div class="kpi-label">Models Trained</div>
+            </div>""", unsafe_allow_html=True)
+        with k3:
+            st.markdown(f"""
+            <div class="kpi-card cyan animate-in animate-in-d3">
+                <div class="kpi-icon">🎯</div>
+                <div class="kpi-value">{best_acc}</div>
+                <div class="kpi-label">Best Accuracy</div>
+            </div>""", unsafe_allow_html=True)
+        with k4:
+            st.markdown(f"""
+            <div class="kpi-card amber animate-in animate-in-d4">
+                <div class="kpi-icon">🧪</div>
+                <div class="kpi-value">{bench_count}</div>
+                <div class="kpi-label">Benchmark Claims</div>
+            </div>""", unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # Visual Pipeline Stepper
+        steps = [
+            ("1", "Collect Data", has_data),
+            ("2", "Train Models", has_models),
+            ("3", "Benchmark", has_bench),
+            ("4", "Analyze", has_results),
+        ]
+        step_html = '<div class="pipeline-stepper animate-in">'
+        for num, label, done in steps:
+            cls = "completed" if done else ""
+            dot_cls = "done" if done else "pending"
+            # Mark the first incomplete step as active
+            if not done and all(s[2] for s in steps[:steps.index((num, label, done))]):
+                dot_cls = "active"
+                cls = "is-active"
+            step_html += f"""
+            <div class="step-item {cls}">
+                <div class="step-dot {dot_cls}">{'✓' if done else num}</div>
+                <div class="step-label">{label}</div>
+            </div>"""
+        step_html += '</div>'
+        st.markdown(step_html, unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        # Getting started + Status
+        g1, g2 = st.columns([3, 2])
+        with g1:
+            st.markdown("""
+            <div class="glass-card">
+                <h3>🚀 Getting Started</h3>
+                <p style='margin-bottom:0.8rem;'>Follow these steps to run the complete fact-checking pipeline:</p>
+                <ol style='padding-left:1.2rem; line-height:2;'>
+                    <li><strong>Data Collection</strong> — Scrape PolitiFact claims by date range</li>
+                    <li><strong>Model Training</strong> — Choose an NLP feature phase and train 6 classifiers (4 ML + ANN + RNN)</li>
+                    <li><strong>Benchmark Testing</strong> — Validate models against Google Fact Check data</li>
+                    <li><strong>Results & Analysis</strong> — Compare metrics, visualize performance, read AI critique</li>
+                </ol>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with g2:
+            st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+            st.markdown("#### 📋 Current Status")
+            if has_data:
+                st.success(f"✅ Data: {total_claims} claims loaded")
+            else:
+                st.warning("⏳ Data: No data collected yet")
+            if has_models:
+                st.success(f"✅ Models: {models_count} models trained")
+            else:
+                st.info("⏳ Models: Awaiting training")
+            if has_bench:
+                st.success(f"✅ Benchmark: {bench_count} claims tested")
+            else:
+                st.info("⏳ Benchmark: Ready when models are trained")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    # ╔══════════════════════════════════════════╗
+    # ║         DATA COLLECTION PAGE             ║
+    # ╚══════════════════════════════════════════╝
+    elif "Data Collection" in page:
+        st.markdown("""
+        <div class="hero-banner animate-in">
+            <h1>📥 Data Collection</h1>
+            <p>Scrape verified political claims from PolitiFact archives</p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        col_form, col_stats = st.columns([3, 2])
+
+        with col_form:
+            st.markdown('<div class="glass-card animate-in animate-in-d1">', unsafe_allow_html=True)
+            st.markdown("#### 🌐 PolitiFact Scraper")
+
             min_date = pd.to_datetime('2007-01-01')
             max_date = pd.to_datetime('today').normalize()
 
-            date_col1, date_col2 = st.columns(2)
-            with date_col1:
-                start_date = st.date_input("Start Date", min_value=min_date, max_value=max_date, value=pd.to_datetime('2023-01-01'))
-            with date_col2:
+            d1, d2 = st.columns(2)
+            with d1:
+                start_date = st.date_input("Start Date", min_value=min_date, max_value=max_date,
+                                           value=pd.to_datetime('2023-01-01'))
+            with d2:
                 end_date = st.date_input("End Date", min_value=min_date, max_value=max_date, value=max_date)
 
-            if st.button("Scrape Politifact Data", key="scrape_btn", use_container_width=True):
+            st.markdown("<br>", unsafe_allow_html=True)
+
+            if st.button("🔄 Start Scraping", key="scrape_btn", use_container_width=True):
                 if start_date > end_date:
-                    st.error("Start date must be before end date")
+                    st.error("Start date must be before end date.")
                 else:
-                    with st.spinner("Scraping political claims..."):
+                    with st.spinner("Scraping political claims…"):
                         scraped_df = scrape_data_by_date_range(pd.to_datetime(start_date), pd.to_datetime(end_date))
-                    
                     if not scraped_df.empty:
                         st.session_state['scraped_df'] = scraped_df
-                        st.markdown(f'<div class="success-box">Successfully scraped {len(scraped_df)} claims!</div>', unsafe_allow_html=True)
+                        st.success(f"✅ Successfully scraped **{len(scraped_df)}** claims!")
                     else:
-                        st.warning("No data found. Try adjusting date range.")
+                        st.warning("No data found. Try adjusting the date range.")
             st.markdown('</div>', unsafe_allow_html=True)
-            
+
             # Data preview
-            if not st.session_state['scraped_df'].empty:
-                st.markdown('<div class="card">', unsafe_allow_html=True)
-                st.subheader("Data Preview")
-                st.dataframe(st.session_state['scraped_df'].head(10), use_container_width=True)
+            if has_data:
+                st.markdown('<div class="glass-card animate-in animate-in-d2">', unsafe_allow_html=True)
+                st.markdown("#### 📋 Data Preview")
+                st.dataframe(st.session_state['scraped_df'].head(12), use_container_width=True, height=440)
                 st.markdown('</div>', unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.subheader("Data Statistics")
-            
-            if not st.session_state['scraped_df'].empty:
+
+        with col_stats:
+            st.markdown('<div class="glass-card animate-in animate-in-d2">', unsafe_allow_html=True)
+            st.markdown("#### 📊 Data Statistics")
+
+            if has_data:
                 df = st.session_state['scraped_df']
                 st.metric("Total Claims", len(df))
-                
-                # Label distribution
-                st.subheader("Label Distribution")
-                label_counts = df['label'].value_counts()
-                for label, count in label_counts.items():
-                    st.write(f"**{label}**: {count}")
+                st.metric("Unique Labels", df['label'].nunique())
+                st.metric("Date Range", f"{df['date'].min()} → {df['date'].max()}" if 'date' in df.columns else "N/A")
+
+                st.markdown("---")
+                st.markdown("##### Label Distribution")
+
+                label_counts = df['label'].value_counts().reset_index()
+                label_counts.columns = ['Label', 'Count']
+
+                colors = ['#6366f1', '#8b5cf6', '#a78bfa', '#22d3ee', '#10b981', '#f59e0b', '#f43f5e', '#ec4899']
+                fig = px.bar(label_counts, x='Count', y='Label', orientation='h',
+                             color='Label', color_discrete_sequence=colors)
+                fig.update_layout(
+                    plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+                    font=dict(color='#94a3b8', family='Inter'),
+                    showlegend=False, height=300,
+                    margin=dict(l=0, r=0, t=10, b=10),
+                    xaxis=dict(gridcolor='rgba(255,255,255,0.05)'),
+                    yaxis=dict(gridcolor='rgba(255,255,255,0.05)')
+                )
+                st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("No data available. Scrape some data first!")
+                st.markdown("""
+                <div style='text-align:center; padding:3rem 1rem; color:#475569 !important;'>
+                    <div style='font-size:3rem; margin-bottom:0.5rem;'>📭</div>
+                    <div style='font-weight:600; font-size:1rem;'>No Data Yet</div>
+                    <div style='font-size:0.85rem; margin-top:0.3rem;'>Configure the scraper and click Start Scraping</div>
+                </div>
+                """, unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
-    
-    # MODEL TRAINING PAGE
-    elif page == "Model Training":
+
+    # ╔══════════════════════════════════════════╗
+    # ║         MODEL TRAINING PAGE              ║
+    # ╚══════════════════════════════════════════╝
+    elif "Model Training" in page:
         st.markdown("""
-        <div class="main-header">
-            <h1>Model Training</h1>
-            <h3>Configure and Train Machine Learning Models</h3>
+        <div class="hero-banner animate-in">
+            <h1>🧠 Model Training</h1>
+            <p>NLP feature extraction · 6 classifiers (4 ML + 2 Deep Learning) · Stratified K-Fold CV · SMOTE balancing</p>
         </div>
         """, unsafe_allow_html=True)
-        
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.subheader("Training Configuration")
-            
-            if st.session_state['scraped_df'].empty:
-                st.warning("Please collect data first from the Data Collection page!")
-            else:
-                phases = [
-                    "Lexical & Morphological",
-                    "Syntactic", 
-                    "Semantic",
-                    "Discourse",
-                    "Pragmatic"
-                ]
-                selected_phase = st.selectbox("Feature Extraction Method:", phases, key='selected_phase')
-                
-                # Feature descriptions
-                feature_descriptions = {
-                    "Lexical & Morphological": "Word-level analysis: lemmatization, stopword removal, n-grams",
-                    "Syntactic": "Grammar structure: part-of-speech tags, sentence patterns", 
-                    "Semantic": "Meaning analysis: sentiment polarity, subjectivity scoring",
-                    "Discourse": "Text structure: sentence count, discourse markers",
-                    "Pragmatic": "Intent analysis: modal verbs, question marks, emphasis markers"
+
+        if st.session_state['scraped_df'].empty:
+            st.warning("⚠️ Please collect data first from the **Data Collection** page!")
+        else:
+            col_config, col_info = st.columns([3, 2])
+
+            with col_config:
+                st.markdown('<div class="glass-card animate-in animate-in-d1">', unsafe_allow_html=True)
+                st.markdown("#### ⚙️ Training Configuration")
+
+                phases = ["Lexical & Morphological", "Syntactic", "Semantic", "Discourse", "Pragmatic"]
+                phase_meta = {
+                    "Lexical & Morphological": ("📝", "Word-level analysis with lemmatization, stopword removal & n-grams"),
+                    "Syntactic":               ("🔤", "Grammar structure via part-of-speech tags & sentence patterns"),
+                    "Semantic":                ("💭", "Sentiment analysis — polarity & subjectivity scoring"),
+                    "Discourse":               ("📐", "Text structure — sentence count & discourse markers"),
+                    "Pragmatic":               ("🎯", "Intent analysis — modal verbs & emphasis markers"),
                 }
-                
-                st.caption(f"*{feature_descriptions[selected_phase]}*")
-                
-                if st.button("Run Model Analysis", key="analyze_btn", use_container_width=True):
-                    with st.spinner(f"Training 4 models with {N_SPLITS}-Fold CV..."):
-                        df_results, trained_models, trained_vectorizer = evaluate_models(st.session_state['scraped_df'], selected_phase)
+
+                selected_phase = st.selectbox("Feature Extraction Method", phases, key='selected_phase')
+
+                icon, desc = phase_meta[selected_phase]
+                st.markdown(f"""
+                <div class="phase-card">
+                    <div class="phase-icon">{icon}</div>
+                    <div>
+                        <div class="phase-name">{selected_phase}</div>
+                        <div class="phase-desc">{desc}</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                st.markdown("<br>", unsafe_allow_html=True)
+
+                if st.button("🚀 Run Model Analysis", key="analyze_btn", use_container_width=True):
+                    with st.spinner(f"Training 6 models (4 ML + 2 Deep Learning) with {N_SPLITS}-Fold Cross Validation…"):
+                        result = evaluate_models(st.session_state['scraped_df'], selected_phase)
+                        if isinstance(result, tuple) and len(result) == 4:
+                            df_results, trained_models, trained_vectorizer, rnn_tok = result
+                        elif isinstance(result, tuple) and len(result) == 3:
+                            df_results, trained_models, trained_vectorizer = result
+                            rnn_tok = None
+                        else:
+                            df_results = result
+                            trained_models = {}
+                            trained_vectorizer = None
+                            rnn_tok = None
                         st.session_state['df_results'] = df_results
                         st.session_state['trained_models'] = trained_models
                         st.session_state['trained_vectorizer'] = trained_vectorizer
+                        st.session_state['rnn_tokenizer'] = rnn_tok
                         st.session_state['selected_phase_run'] = selected_phase
-                        st.markdown('<div class="success-box">Analysis complete! Results ready in Results & Analysis page.</div>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-        
-        with col2:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.subheader("Model Information")
-            st.markdown("""
-            **Available Models:**
-            - Naive Bayes
-            - Decision Tree  
-            - Logistic Regression
-            - SVM
-            
-            **Training Features:**
-            - 5-Fold Cross Validation
-            - SMOTE for imbalance
-            - Multiple NLP phases
-            - Performance metrics
-            """)
-            
-            if st.session_state['trained_models']:
-                st.success(f"{len(st.session_state['trained_models'])} models trained")
-                st.info(f"Last phase: {st.session_state.get('selected_phase_run', 'N/A')}")
-            st.markdown('</div>', unsafe_allow_html=True)
-    
-    # BENCHMARK TESTING PAGE
-    elif page == "Benchmark Testing":
+                        st.success("✅ Analysis complete! View results in **Results & Analysis** page.")
+                st.markdown('</div>', unsafe_allow_html=True)
+
+                # Quick results preview
+                if has_results:
+                    st.markdown('<div class="glass-card animate-in animate-in-d2">', unsafe_allow_html=True)
+                    st.markdown("#### ⚡ Quick Results Preview")
+                    df_r = st.session_state['df_results']
+                    cols = st.columns(len(df_r))
+                    accents = ['indigo', 'emerald', 'cyan', 'amber', 'rose', 'violet']
+                    for i, (_, row) in enumerate(df_r.iterrows()):
+                        with cols[i]:
+                            acc_cls = accents[i % len(accents)]
+                            st.markdown(f"""
+                            <div class="kpi-card {acc_cls}">
+                                <div class="kpi-value">{row['Accuracy']:.1f}%</div>
+                                <div class="kpi-label">{row['Model']}</div>
+                            </div>""", unsafe_allow_html=True)
+                    st.markdown('</div>', unsafe_allow_html=True)
+
+            with col_info:
+                st.markdown('<div class="glass-card animate-in animate-in-d2">', unsafe_allow_html=True)
+                st.markdown("#### 🤖 Model Arsenal")
+                models_info = [
+                    ("🟣", "Naive Bayes", "Fast probabilistic classifier"),
+                    ("🟢", "Decision Tree", "Interpretable rule-based splits"),
+                    ("🔵", "Logistic Regression", "Linear boundary with regularization"),
+                    ("🟠", "SVM", "Maximum margin hyperplane classifier"),
+                    ("🔴", "ANN", "Feedforward neural network (Dense layers)"),
+                    ("🟡", "RNN (LSTM)", "Bidirectional LSTM for sequence learning"),
+                ]
+                for dot, name, desc_ in models_info:
+                    st.markdown(f"""
+                    <div class="phase-card">
+                        <div class="phase-icon">{dot}</div>
+                        <div>
+                            <div class="phase-name">{name}</div>
+                            <div class="phase-desc">{desc_}</div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+                st.markdown('<div class="glass-card animate-in animate-in-d3">', unsafe_allow_html=True)
+                st.markdown("#### 📋 Training Pipeline")
+                st.markdown("""
+                - 🔀 **Stratified K-Fold** — 5 balanced folds
+                - ⚖️ **SMOTE** — Synthetic oversampling for class balance
+                - 🧠 **Deep Learning** — ANN + Bidirectional LSTM
+                - 📈 **Metrics** — Accuracy, F1, Precision, Recall
+                - ⏱️ **Timing** — Training + inference latency
+                """)
+                if has_models:
+                    st.success(f"✅ {len(st.session_state['trained_models'])} models trained")
+                    st.info(f"Phase: **{st.session_state.get('selected_phase_run', 'N/A')}**")
+                st.markdown('</div>', unsafe_allow_html=True)
+
+    # ╔══════════════════════════════════════════╗
+    # ║        BENCHMARK TESTING PAGE            ║
+    # ╚══════════════════════════════════════════╝
+    elif "Benchmark" in page:
         st.markdown("""
-        <div class="main-header">
-            <h1>Benchmark Testing</h1>
-            <h3>Validate Models with Real-World Fact Check Data</h3>
+        <div class="hero-banner animate-in">
+            <h1>🎯 Benchmark Testing</h1>
+            <p>Validate trained models against real-world fact-check data</p>
         </div>
         """, unsafe_allow_html=True)
-        
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.subheader("Fact Check Benchmark")
-        
-        # Mode selection
-        mode_col1, mode_col2 = st.columns(2)
-        with mode_col1:
-            use_demo = st.checkbox("Google Fact Check API", value=True, 
-                                  help="Test with sample fact-check data - no API key needed")
-        with mode_col2:
+
+        st.markdown('<div class="glass-card animate-in animate-in-d1">', unsafe_allow_html=True)
+        st.markdown("#### 🧪 Fact Check Benchmark Configuration")
+
+        m1, m2, m3 = st.columns([2, 2, 1])
+        with m1:
+            use_demo = st.checkbox("Use Demo Data (no API key needed)", value=True,
+                                   help="Test with 15 built-in sample fact-check claims")
+        with m2:
             if not use_demo:
                 if 'GOOGLE_API_KEY' not in st.secrets:
-                    st.error("API Key not found in secrets.toml")
-                    st.info("Switch to Demo Mode or add your key to .streamlit/secrets.toml")
+                    st.error("API Key not found in **.streamlit/secrets.toml**")
                 else:
                     st.success("✅ API Key found!")
-        
-        bench_col1, bench_col2, bench_col3 = st.columns([2,2,1])
-        
-        with bench_col1:
-            num_claims = st.slider(
-                "Number of test claims:",
-                min_value=5,
-                max_value=50,
-                value=10,
-                step=5,
-                key='num_claims'
-            )
-        
-        with bench_col2:
-            st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("Run Benchmark Test", key="benchmark_btn", use_container_width=True):
+        with m3:
+            num_claims = st.number_input("Claims to fetch", min_value=5, max_value=500, value=50, step=10, key='num_claims',
+                                          help="Number of claims to fetch from Google Fact Check API (no upper limit enforced by API)")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        b1, b2 = st.columns([3, 1])
+        with b1:
+            if st.button("🚀 Run Benchmark Test", key="benchmark_btn", use_container_width=True):
                 if not st.session_state.get('trained_models'):
-                    st.error("Please train models first in the Model Training page!")
+                    st.error("Please train models first in the **Model Training** page!")
                 else:
-                    with st.spinner('Loading fact-check data...'):
+                    with st.spinner('Loading and testing fact-check data…'):
                         if use_demo:
                             api_results = get_demo_google_claims()
-                            st.success("✅ Google Fact Check loaded successfully!")
+                            st.success("✅ Demo data loaded!")
                         else:
                             api_key = st.secrets["GOOGLE_API_KEY"]
                             api_results = fetch_google_claims(api_key, num_claims)
                             if api_results:
-                                st.success(f"✅ Fetched {len(api_results)} claims from Google API!")
-                        
+                                st.success(f"✅ Fetched {len(api_results)} claims!")
+
                         google_df = process_and_map_google_claims(api_results)
 
                         if not google_df.empty:
-                            trained_models = st.session_state['trained_models']
-                            trained_vectorizer = st.session_state['trained_vectorizer']
-                            selected_phase_run = st.session_state['selected_phase_run']
-                            benchmark_results_df = run_google_benchmark(google_df, trained_models, trained_vectorizer, selected_phase_run)
-                            st.session_state['google_benchmark_results'] = benchmark_results_df
+                            benchmark_df = run_google_benchmark(
+                                google_df,
+                                st.session_state['trained_models'],
+                                st.session_state['trained_vectorizer'],
+                                st.session_state['selected_phase_run'],
+                                st.session_state.get('rnn_tokenizer', None)
+                            )
+                            st.session_state['google_benchmark_results'] = benchmark_df
                             st.session_state['google_df'] = google_df
-                            st.markdown(f'<div class="success-box">✅ Benchmark complete! Tested on {len(google_df)} claims.</div>', unsafe_allow_html=True)
+                            st.success(f"✅ Benchmark complete — tested on **{len(google_df)}** claims!")
                         else:
-                            st.warning("No claims were processed. Try adjusting parameters.")
-        
-        with bench_col3:
-            st.markdown("<br>", unsafe_allow_html=True)
-            st.caption("Tests models against fact-check data")
-        
-        # Benchmark results preview
-        if not st.session_state['google_benchmark_results'].empty:
-            st.subheader("Benchmark Results")
-            st.dataframe(st.session_state['google_benchmark_results'], use_container_width=True)
-        
+                            st.warning("No claims processed. Try adjusting parameters.")
+        with b2:
+            st.caption("Tests trained models against independent fact-check data")
+
         st.markdown('</div>', unsafe_allow_html=True)
-    
-    # RESULTS & ANALYSIS PAGE
-    elif page == "Results & Analysis":
+
+        # Benchmark results
+        if has_bench:
+            st.markdown('<div class="glass-card animate-in animate-in-d2">', unsafe_allow_html=True)
+            st.markdown("#### 📊 Benchmark Results")
+            bench_df = st.session_state['google_benchmark_results']
+
+            # Metric cards
+            cols = st.columns(len(bench_df))
+            accents = ['indigo', 'emerald', 'cyan', 'amber', 'rose', 'violet']
+            for i, (_, row) in enumerate(bench_df.iterrows()):
+                with cols[i]:
+                    st.markdown(f"""
+                    <div class="kpi-card {accents[i % len(accents)]}">
+                        <div class="kpi-value">{row['Accuracy']:.1f}%</div>
+                        <div class="kpi-label">{row['Model']}</div>
+                    </div>""", unsafe_allow_html=True)
+
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.dataframe(bench_df, use_container_width=True, hide_index=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    # ╔══════════════════════════════════════════╗
+    # ║       RESULTS & ANALYSIS PAGE            ║
+    # ╚══════════════════════════════════════════╝
+    elif "Results" in page:
         st.markdown("""
-        <div class="main-header">
-            <h1>Results & Analysis</h1>
-            <h3>Comprehensive Performance Metrics and Insights</h3>
+        <div class="hero-banner animate-in">
+            <h1>📊 Results & Analysis</h1>
+            <p>Comprehensive performance metrics, visualizations & AI critique</p>
         </div>
         """, unsafe_allow_html=True)
-        
+
         if st.session_state['df_results'].empty:
-            st.warning("No results available. Please train models first in the Model Training page!")
+            st.warning("⚠️ No results available. Please train models first in the **Model Training** page!")
         else:
-            # Main results section
-            st.header("Model Performance Results")
-            
-            # Model Metrics in Cards
-            results_col1, results_col2, results_col3, results_col4 = st.columns(4)
             df_results = st.session_state['df_results']
-            
-            metrics_data = []
-            for _, row in df_results.iterrows():
-                metrics_data.append({
-                    'model': row['Model'],
-                    'accuracy': row['Accuracy'],
-                    'f1': row['F1-Score'],
-                    'training_time': row['Training Time (s)']
-                })
-            
-            for i, metric in enumerate(metrics_data):
-                col = [results_col1, results_col2, results_col3, results_col4][i]
-                with col:
+
+            # ── Winner Podium ──
+            sorted_df = df_results.sort_values('F1-Score', ascending=False).reset_index(drop=True)
+            medals = ["🥇", "🥈", "🥉"]
+            card_cls = ["gold", "silver", "bronze"]
+            st.markdown("### 🏆 Winner's Podium")
+
+            podium_cols = st.columns(min(len(sorted_df), 3))
+            for i in range(min(len(sorted_df), 3)):
+                row = sorted_df.iloc[i]
+                with podium_cols[i]:
                     st.markdown(f"""
-                    <div class="metric-card">
-                        <h3>{metric['model']}</h3>
-                        <h2>{metric['accuracy']:.1f}%</h2>
-                        <p>F1: {metric['f1']:.3f} | Time: {metric['training_time']}s</p>
+                    <div class="podium-card {card_cls[i]} animate-in animate-in-d{i+1}">
+                        <div class="podium-medal">{medals[i]}</div>
+                        <div class="podium-name">{row['Model']}</div>
+                        <div class="podium-score">{row['Accuracy']:.1f}%</div>
+                        <div class="podium-sub">F1: {row['F1-Score']:.3f} · {row['Inference Latency (ms)']}ms</div>
                     </div>
                     """, unsafe_allow_html=True)
-            
-            # Detailed Results and Visualizations
+
             st.markdown("---")
-            viz_col1, viz_col2 = st.columns(2)
-            
-            with viz_col1:
-                st.subheader("Performance Metrics")
-                chart_metric = st.selectbox(
-                    "Select metric to visualize:",
+
+            # ── Charts Tabs ──
+            tab1, tab2, tab3 = st.tabs(["📊 Metrics Comparison", "🕸️ Radar Chart", "⚡ Speed vs Accuracy"])
+
+            with tab1:
+                st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+                metric_choice = st.selectbox(
+                    "Select metric:",
                     ['Accuracy', 'F1-Score', 'Precision', 'Recall', 'Training Time (s)', 'Inference Latency (ms)'],
                     key='chart_metric'
                 )
-                
-                chart_data = df_results[['Model', chart_metric]].set_index('Model')
-                st.bar_chart(chart_data)
-            
-            with viz_col2:
-                st.subheader("Speed vs Accuracy Trade-off")
-                
-                fig, ax = plt.subplots(figsize=(8, 6))
-                colors = ['#00a8e1', '#00c8ff', '#1a8cd8', '#2d9cdb']
-                
-                for i, (_, row) in enumerate(df_results.iterrows()):
-                    ax.scatter(row['Inference Latency (ms)'], row['Accuracy'], 
-                              s=200, alpha=0.7, color=colors[i], label=row['Model'])
-                    ax.annotate(row['Model'], 
-                               (row['Inference Latency (ms)'] + 5, row['Accuracy']), 
-                               fontsize=9, alpha=0.8)
-                
-                ax.set_xlabel('Inference Latency (ms)')
-                ax.set_ylabel('Accuracy (%)')
-                ax.set_title('Model Performance: Speed vs Accuracy')
-                ax.grid(True, alpha=0.3)
-                ax.legend()
-                st.pyplot(fig)
+                fig = px.bar(
+                    df_results, x='Model', y=metric_choice,
+                    color='Model',
+                    color_discrete_sequence=['#6366f1', '#10b981', '#22d3ee', '#f59e0b', '#f43f5e', '#a78bfa'],
+                    text=df_results[metric_choice].apply(lambda v: f"{v:.2f}" if isinstance(v, float) else str(v))
+                )
+                fig.update_layout(
+                    plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+                    font=dict(color='#94a3b8', family='Inter'),
+                    showlegend=False, height=420,
+                    margin=dict(l=40, r=20, t=30, b=60),
+                    xaxis=dict(gridcolor='rgba(255,255,255,0.05)', title=''),
+                    yaxis=dict(gridcolor='rgba(255,255,255,0.05)', title=metric_choice),
+                )
+                fig.update_traces(textposition='outside', textfont=dict(color='#e2e8f0', size=12, family='Inter'))
+                st.plotly_chart(fig, use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
 
-            # Google Benchmark Results
-            if not st.session_state['google_benchmark_results'].empty:
+            with tab2:
+                st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+                categories = ['Accuracy', 'F1-Score', 'Precision', 'Recall']
+                fig_radar = go.Figure()
+                radar_colors = ['#6366f1', '#10b981', '#22d3ee', '#f59e0b', '#f43f5e', '#a78bfa']
+                for i, (_, row) in enumerate(df_results.iterrows()):
+                    values = [row[c] if c != 'Accuracy' else row[c] / 100 for c in categories]
+                    values.append(values[0])
+                    fig_radar.add_trace(go.Scatterpolar(
+                        r=values,
+                        theta=categories + [categories[0]],
+                        fill='toself',
+                        name=row['Model'],
+                        line=dict(color=radar_colors[i % len(radar_colors)]),
+                        fillcolor=radar_colors[i % len(radar_colors)].replace(')', ',0.1)').replace('rgb', 'rgba') if 'rgb' in radar_colors[i % len(radar_colors)] else None,
+                        opacity=0.8,
+                    ))
+                fig_radar.update_layout(
+                    polar=dict(
+                        bgcolor='rgba(0,0,0,0)',
+                        radialaxis=dict(visible=True, range=[0, 1], gridcolor='rgba(255,255,255,0.08)',
+                                        tickfont=dict(color='#64748b', size=10)),
+                        angularaxis=dict(gridcolor='rgba(255,255,255,0.08)',
+                                         tickfont=dict(color='#94a3b8', size=11, family='Inter')),
+                    ),
+                    paper_bgcolor='rgba(0,0,0,0)',
+                    font=dict(color='#94a3b8', family='Inter'),
+                    legend=dict(font=dict(color='#94a3b8')),
+                    height=450, margin=dict(l=60, r=60, t=40, b=40),
+                )
+                st.plotly_chart(fig_radar, use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            with tab3:
+                st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+                fig_scatter = px.scatter(
+                    df_results, x='Inference Latency (ms)', y='Accuracy',
+                    size='F1-Score', color='Model',
+                    color_discrete_sequence=['#6366f1', '#10b981', '#22d3ee', '#f59e0b', '#f43f5e', '#a78bfa'],
+                    text='Model', size_max=40,
+                )
+                fig_scatter.update_traces(textposition='top center',
+                                          textfont=dict(color='#e2e8f0', size=11, family='Inter'))
+                fig_scatter.update_layout(
+                    plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+                    font=dict(color='#94a3b8', family='Inter'),
+                    height=420, margin=dict(l=40, r=20, t=30, b=60),
+                    xaxis=dict(gridcolor='rgba(255,255,255,0.05)', title='Inference Latency (ms)'),
+                    yaxis=dict(gridcolor='rgba(255,255,255,0.05)', title='Accuracy (%)'),
+                )
+                st.plotly_chart(fig_scatter, use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
+
+            # ── Detailed Metrics Table ──
+            st.markdown("---")
+            st.markdown("### 📋 Detailed Metrics")
+            st.dataframe(df_results, use_container_width=True, hide_index=True)
+
+            # ── Google Benchmark Comparison ──
+            if has_bench:
                 st.markdown("---")
-                st.header("Fact Check Benchmark Results")
-                
+                st.markdown("### 🔄 PolitiFact vs Google Benchmark Comparison")
+
                 google_results = st.session_state['google_benchmark_results']
-                politifacts_results = st.session_state['df_results']
-                
-                # Comparison metrics
-                st.subheader("Performance Comparison")
-                comp_col1, comp_col2, comp_col3, comp_col4 = st.columns(4)
-                
+                comp_cols = st.columns(len(google_results))
+
                 for idx, (_, row) in enumerate(google_results.iterrows()):
                     model_name = row['Model']
-                    google_accuracy = row['Accuracy']
-                    
-                    # Find corresponding Politifacts accuracy
-                    politifacts_row = politifacts_results[politifacts_results['Model'] == model_name]
-                    if not politifacts_row.empty:
-                        politifacts_accuracy = politifacts_row['Accuracy'].values[0]
-                        delta = google_accuracy - politifacts_accuracy
+                    google_acc = row['Accuracy']
+                    pf_row = df_results[df_results['Model'] == model_name]
+                    if not pf_row.empty:
+                        pf_acc = pf_row['Accuracy'].values[0]
+                        delta = google_acc - pf_acc
                         delta_color = "normal" if delta >= 0 else "inverse"
                     else:
                         delta = None
                         delta_color = "off"
-                    
-                    col = [comp_col1, comp_col2, comp_col3, comp_col4][idx]
-                    with col:
+
+                    with comp_cols[idx]:
                         if delta is not None:
-                            st.metric(
-                                label=f"{model_name}",
-                                value=f"{google_accuracy:.1f}%",
-                                delta=f"{delta:+.1f}%",
-                                delta_color=delta_color
-                            )
+                            st.metric(label=model_name, value=f"{google_acc:.1f}%",
+                                      delta=f"{delta:+.1f}%", delta_color=delta_color)
                         else:
-                            st.metric(
-                                label=f"{model_name}",
-                                value=f"{google_accuracy:.1f}%"
-                            )
+                            st.metric(label=model_name, value=f"{google_acc:.1f}%")
 
-            # HUMOROUS CRITIQUE SECTION
+            # ── AI Humorous Critique ──
             st.markdown("---")
-            st.header("AI Performance Review")
-            
-            critique_col1, critique_col2 = st.columns([2, 1])
-            
-            with critique_col1:
-                st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown("### 🎭 AI Performance Review")
+
+            cr1, cr2 = st.columns([3, 2])
+            with cr1:
                 critique_text = generate_humorous_critique(
-                    st.session_state['df_results'], 
-                    st.session_state['selected_phase_run']
+                    st.session_state['df_results'],
+                    st.session_state.get('selected_phase_run', 'Unknown')
                 )
-                st.markdown(critique_text)
-                st.markdown('</div>', unsafe_allow_html=True)
-            
-            with critique_col2:
-                st.markdown('<div class="card">', unsafe_allow_html=True)
-                st.subheader("Winner's Circle")
-                if not st.session_state['df_results'].empty:
-                    best_model = st.session_state['df_results'].loc[st.session_state['df_results']['F1-Score'].idxmax()]
+                st.markdown(f'<div class="critique-card">{critique_text}</div>', unsafe_allow_html=True)
+
+            with cr2:
+                st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+                st.markdown("#### 🏅 Champion Model")
+                if not df_results.empty:
+                    best = df_results.loc[df_results['F1-Score'].idxmax()]
                     st.markdown(f"""
-                    **Champion Model:**  
-                    **{best_model['Model']}**
-                    
-                    **Performance:**  
-                    {best_model['Accuracy']:.1f}% Accuracy  
-                    {best_model['F1-Score']:.3f} F1-Score  
-                    {best_model['Inference Latency (ms)']}ms Inference
-                    
-                    **Feature Set:**  
-                    {st.session_state['selected_phase_run']}
-                    """)
+                    <div style='text-align:center; padding:0.5rem 0;'>
+                        <div style='font-size:2.5rem;'>🏆</div>
+                        <div style='font-size:1.2rem; font-weight:800; color:#f1f5f9 !important; margin:0.3rem 0;'>{best['Model']}</div>
+                        <div style='font-size:2rem; font-weight:800; color:#6366f1 !important;'>{best['Accuracy']:.1f}%</div>
+                        <div style='font-size:0.82rem; color:#64748b !important; margin-top:0.3rem;'>
+                            F1: {best['F1-Score']:.3f} · Precision: {best['Precision']:.3f} · Recall: {best['Recall']:.3f}
+                        </div>
+                        <div style='margin-top:0.8rem;'>
+                            <span class="status-badge ready">{st.session_state.get('selected_phase_run', 'N/A')}</span>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
 
-# --- Run App ---
+
+# ── Run App ──
 if __name__ == '__main__':
     app()
+
